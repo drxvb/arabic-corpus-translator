@@ -242,11 +242,39 @@ def stage_c_llm_draft(text_en: str, term_hints: Dict[str, Any],
 # Stage D — Validator (v0.2 — calque-rate metric implemented)
 # ---------------------------------------------------------------------------
 
+def _arabic_word_boundary_search(needle: str, haystack: str) -> bool:
+    """v0.2.1: Word-boundary-aware substring search for Arabic text.
+
+    Plain `needle in haystack` matched 'بيان' inside 'البيانات' (false
+    positive on a longer Arabic word containing the needle). Fix follows
+    the humanizer v2.4.5 pattern: require the matched span to NOT be
+    followed by an Arabic letter (lookahead negation).
+
+    Note: we don't restrict the LEADING boundary, because Arabic proclitics
+    (بـ, لـ, كـ, ال) attach to the word; 'البيانات' contains 'البيان' as
+    a real partial match (the definite article + base word), but 'بيان'
+    standing alone inside 'البيانات' is what we want to reject. The
+    trailing-letter check accomplishes that: 'البيانات' is 'البيان' + 'ات'
+    so a 'بيان' lookup would find a match but fail the trailing-non-letter
+    test.
+    """
+    if not needle or not haystack:
+        return False
+    # Arabic letter block: U+0621-U+064A (plus U+0670 dagger alif).
+    arabic_letter_re = r"[ء-يٰ]"
+    pat = re.escape(needle) + r"(?!" + arabic_letter_re + r")"
+    return re.search(pat, haystack) is not None
+
+
 def stage_d_validate(draft_ar: str, source_en: str) -> Dict[str, Any]:
     """Score the AR draft on:
-      - calque_rate: how many ai_default_calque entries appear in draft (lower is better)
-      - term_fidelity: how many natural_arabic forms appear (higher is better)
+      - calque_rate: how many ai_default_calque entries appear (word-boundary safe)
+      - term_fidelity: how many natural_arabic forms appear (word-boundary safe)
       - n_gram_naturalness: STUB (deferred to v0.3+ when corpus_stats.py wired in)
+
+    v0.2.1: switched from naive `in` substring match to word-boundary
+    regex to eliminate false positives like `بيان` matching inside
+    `البيانات`. Same fix pattern as humanizer v2.4.5.
     """
     entries = _load_calque_entries()
     if not entries:
@@ -266,9 +294,9 @@ def stage_d_validate(draft_ar: str, source_en: str) -> Dict[str, Any]:
     for e in entries:
         calque = e.get("ai_default_calque", "").strip()
         natural = e.get("natural_arabic", "").strip()
-        if calque and calque in draft_ar:
+        if calque and _arabic_word_boundary_search(calque, draft_ar):
             calque_hits.append(calque)
-        if natural and natural in draft_ar:
+        if natural and _arabic_word_boundary_search(natural, draft_ar):
             natural_hits.append(natural)
 
     # Crude token count (whitespace-separated)
