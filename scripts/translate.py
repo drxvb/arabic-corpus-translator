@@ -164,69 +164,77 @@ def _corpus_confirm(term_ar: str, domain: str) -> Optional[Tuple[bool, int]]:
 
 
 # v0.3.1: Asset G (domain-terminology paired EN<->AR terms from toolkit v0.9+).
-# Direct EN-pair injection in Stage A: when the input text contains an EN term
-# that's in Asset G, inject the AR translation as a direct hint to the LLM.
-# Asset G is COMPLEMENTARY to the calque dictionary (Asset A): A catalogs AI
-# errors, G catalogs standard terminology. Both inject; dedup at output time.
-_domain_terminology_cache: Optional[Dict[str, Any]] = None
-_domain_terminology_mtime: Optional[float] = None
+# v1.0.1: multi-domain support. Loader keys by domain; technology and news both
+# supported. Domain-specific file path: domain-terminology.json (technology,
+# default) or domain-terminology-news.json (news).
+_domain_terminology_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+_domain_terminology_mtime: Dict[str, Optional[float]] = {}
 
 
-def _load_domain_terminology() -> Optional[Dict[str, Any]]:
-    """Load Asset G. Returns None if toolkit not present, asset missing, or
-    schema MAJOR version incompatible. Single-domain for now (technology);
-    future v0.3.2 may key by domain."""
-    global _domain_terminology_cache, _domain_terminology_mtime
+def _domain_terminology_path(tk_root, domain: str) -> Path:
+    """Map domain -> filename. Technology uses the canonical name; other
+    domains use a -<domain> suffix."""
+    if domain == "technology":
+        return tk_root / "corpus" / "domain-terminology.json"
+    return tk_root / "corpus" / f"domain-terminology-{domain}.json"
+
+
+def _load_domain_terminology(domain: str = "technology") -> Optional[Dict[str, Any]]:
+    """Load Asset G for the given domain. Returns None if toolkit not present,
+    asset missing, or schema MAJOR version incompatible. Cache keyed by domain.
+
+    v1.0.1: multi-domain. Technology and news supported.
+    """
+    if domain in _domain_terminology_cache and _domain_terminology_cache[domain] is not None:
+        cached_mtime = _domain_terminology_mtime.get(domain)
+        if cached_mtime is not None:
+            tk = _toolkit_root()
+            if tk is not None:
+                p = _domain_terminology_path(tk, domain)
+                if p.exists() and p.stat().st_mtime == cached_mtime:
+                    return _domain_terminology_cache[domain]
     tk = _toolkit_root()
     if tk is None:
-        _domain_terminology_cache = None
-        _domain_terminology_mtime = None
+        _domain_terminology_cache[domain] = None
         return None
-    p = tk / "corpus" / "domain-terminology.json"
+    p = _domain_terminology_path(tk, domain)
     if not p.exists():
-        _domain_terminology_cache = None
-        _domain_terminology_mtime = None
+        _domain_terminology_cache[domain] = None
         return None
-    mtime = p.stat().st_mtime
-    if _domain_terminology_cache is not None and _domain_terminology_mtime == mtime:
-        return _domain_terminology_cache
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        _domain_terminology_cache = None
-        _domain_terminology_mtime = None
+        _domain_terminology_cache[domain] = None
         return None
     schema_major = data.get("$schema_version", "0.0.0").split(".")[0]
     if schema_major != "1":
-        _domain_terminology_cache = None
+        _domain_terminology_cache[domain] = None
         return None
-    # Index by lowercase EN for whole-word matching
     by_en: Dict[str, Dict[str, Any]] = {}
     for pair in data.get("pairs", []):
         en = pair.get("en", "").strip().lower()
         if en:
             by_en[en] = pair
     data["_by_en"] = by_en
-    _domain_terminology_cache = data
-    _domain_terminology_mtime = mtime
+    _domain_terminology_cache[domain] = data
+    _domain_terminology_mtime[domain] = p.stat().st_mtime
     return data
 
 
-def _find_terminology_pairs_in_text(text_en: str) -> List[Dict[str, Any]]:
-    """Whole-word EN match against Asset G. Returns matched pairs."""
-    data = _load_domain_terminology()
+def _find_terminology_pairs_in_text(text_en: str, domain: str = "technology") -> List[Dict[str, Any]]:
+    """Whole-word EN match against Asset G for the given domain.
+    v1.0.1: domain-keyed."""
+    data = _load_domain_terminology(domain)
     if data is None or not text_en:
         return []
     text_lower = text_en.lower()
     by_en = data.get("_by_en", {})
     hits: List[Dict[str, Any]] = []
-    seen: set = set()  # dedup by EN string
-    # Sort by EN length desc so multi-word terms match before substrings
+    seen: set = set()
     sorted_ens = sorted(by_en.keys(), key=len, reverse=True)
     for en in sorted_ens:
         if en in seen:
             continue
-        # Whole-word match
         pattern = r"\b" + re.escape(en) + r"\b"
         if re.search(pattern, text_lower):
             hits.append(by_en[en])
@@ -344,14 +352,13 @@ def stage_a_terminology(text_en: str, domain: str) -> Dict[str, Any]:
         "topic_guards_active": [],
         "matched_count": 0,
         "asset_f_available": _load_terminology_candidates(domain) is not None,
-        "asset_g_available": _load_domain_terminology() is not None,
+        "asset_g_available": _load_domain_terminology(domain) is not None,
         "asset_g_terminology_hits": [],
     }
-    # v0.3.1: scan input EN text for direct Asset G pairs first. These are
-    # corpus-grounded EN<->AR pairs whose role is "standard terminology"
-    # (vs Asset A's "AI error catalog"). The LLM gets BOTH sets injected
-    # for prompts where terms appear in both.
-    g_hits = _find_terminology_pairs_in_text(text_en)
+    # v0.3.1: scan input EN text for direct Asset G pairs first.
+    # v1.0.1: domain-aware -- uses technology pairs for --domain technology,
+    # news pairs for --domain news, etc.
+    g_hits = _find_terminology_pairs_in_text(text_en, domain)
     for pair in g_hits:
         hints["asset_g_terminology_hits"].append({
             "en": pair.get("en"),
@@ -690,7 +697,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
     output_ar = stage_d.get("cleaned_draft_ar") or stage_c.get("draft_ar", "")
 
     return {
-        "translator_version": "1.0.0",
+        "translator_version": "1.0.1",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
