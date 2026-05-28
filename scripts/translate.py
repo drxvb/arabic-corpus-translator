@@ -788,10 +788,39 @@ def stage_b_tm_lookup(text_en: str, domain: str) -> Dict[str, Any]:
 # Top-level orchestration
 # ---------------------------------------------------------------------------
 
+# v1.3.0: Stage F quality gate via humanizer.score_text_deep (humanizer
+# v2.10.0+). After all other stages, score the final output on the 4-dim
+# cognitive rubric. Pass-through if humanizer not importable.
+def stage_f_quality_gate(text_ar: str, register: str = "news",
+                          proxy_name: str = "gemini",
+                          deep: bool = False) -> Dict[str, Any]:
+    """Score final output via humanizer. Heuristic if deep=False; LLM-backed if deep=True.
+    Returns {available, score, backend, ...}. Pass-through if humanizer absent."""
+    repo_root = os.environ.get("ARABIC_HUMANIZER_ROOT") or str(
+        Path(__file__).resolve().parent.parent.parent / "arabic-ai-text-humanizer"
+    )
+    h_scripts = Path(repo_root) / "scripts"
+    if not (h_scripts / "humanize_v2.py").exists():
+        return {"available": False, "reason": "humanizer not at sibling path"}
+    try:
+        if str(h_scripts) not in sys.path:
+            sys.path.insert(0, str(h_scripts))
+        if deep:
+            from humanize_v2 import score_text_deep  # type: ignore
+            return score_text_deep(text_ar, register=register, proxy_name=proxy_name)
+        else:
+            from humanize_v2 import score_text  # type: ignore
+            return score_text(text_ar, register=register)
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+
 def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 3,
               review_with: Optional[str] = None,
               auto_apply_corrections: bool = True,
-              llm_proxy: Optional[str] = None) -> Dict[str, Any]:
+              llm_proxy: Optional[str] = None,
+              quality_gate: bool = False,
+              deep_quality: bool = False) -> Dict[str, Any]:
     """Full pipeline. v0.2: A + C real, B stubbed, D real.
     On verdict=='fail' AND strict=True, returns with strict_failure=True.
     """
@@ -825,8 +854,14 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
             output_ar, n_applied = apply_cross_vendor_corrections(output_ar, stage_e["corrections"])
             stage_e["corrections_applied"] = n_applied
 
+    # v1.3.0: optional Stage F quality gate via humanizer
+    stage_f = None
+    if quality_gate:
+        register = "news"  # could be domain-derived in future
+        stage_f = stage_f_quality_gate(output_ar, register=register, deep=deep_quality)
+
     return {
-        "translator_version": "1.2.0",
+        "translator_version": "1.3.0",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
@@ -834,6 +869,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
             "C_llm_draft": stage_c,
             "D_validator": stage_d,
             "E_cross_vendor_review": stage_e,
+            "F_quality_gate": stage_f,
         },
         "regen_count": regen_count,
         "output_ar": output_ar,
@@ -863,6 +899,11 @@ def main() -> int:
                         "If correction suggestions come back, auto-applies them (unless --no-auto-correct).")
     p.add_argument("--no-auto-correct", action="store_true",
                    help="Disable auto-application of Stage E corrections (report only).")
+    p.add_argument("--quality-gate", action="store_true",
+                   help="Stage F: run humanizer.score_text on the final output. Heuristic — fast.")
+    p.add_argument("--deep-quality", action="store_true",
+                   help="Stage F upgraded: humanizer.score_text_deep (LLM-backed cognitive rubric). "
+                        "Implies --quality-gate.")
     p.add_argument("--json", action="store_true", help="Emit full pipeline result as JSON")
 
     args = p.parse_args()
@@ -879,7 +920,9 @@ def main() -> int:
     result = translate(text, args.domain, strict=args.strict, max_regen=args.max_regen,
                        review_with=args.review_with,
                        auto_apply_corrections=not args.no_auto_correct,
-                       llm_proxy=args.llm_proxy)
+                       llm_proxy=args.llm_proxy,
+                       quality_gate=args.quality_gate or args.deep_quality,
+                       deep_quality=args.deep_quality)
     if args.output:
         Path(args.output).write_text(result["output_ar"], encoding="utf-8")
     if args.json:
