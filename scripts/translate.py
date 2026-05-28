@@ -559,14 +559,23 @@ def apply_cross_vendor_corrections(draft_ar: str,
 
 
 def stage_c_llm_draft(text_en: str, term_hints: Dict[str, Any],
-                      tm_hints: Dict[str, Any], domain: str) -> Dict[str, Any]:
+                      tm_hints: Dict[str, Any], domain: str,
+                      proxy_name: Optional[str] = None) -> Dict[str, Any]:
     """Call the configured LLM endpoint. Returns the AR draft + metadata.
-    Endpoint configured via env vars (same pattern as arabic-ai-text-humanizer):
-      LLM_API_URL, LLM_API_KEY, LLM_MODEL
+
+    v1.2.0: if proxy_name is one of {kimi, codex, gemini, minimax}, uses the
+    LAN-local proxy fleet directly (no env vars needed). Otherwise falls back
+    to LLM_API_URL/LLM_API_KEY/LLM_MODEL env vars (v1.0.x pattern).
     """
-    api_url = os.environ.get("LLM_API_URL")
-    api_key = os.environ.get("LLM_API_KEY")
-    model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+    if proxy_name and proxy_name in _REVIEW_PROXIES:
+        p = _REVIEW_PROXIES[proxy_name]
+        api_url = p["url"] + "/v1/chat/completions"
+        api_key = p["key"]
+        model = p["model"]
+    else:
+        api_url = os.environ.get("LLM_API_URL")
+        api_key = os.environ.get("LLM_API_KEY")
+        model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 
     if not api_url or not api_key:
         return {
@@ -781,23 +790,23 @@ def stage_b_tm_lookup(text_en: str, domain: str) -> Dict[str, Any]:
 
 def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 3,
               review_with: Optional[str] = None,
-              auto_apply_corrections: bool = True) -> Dict[str, Any]:
+              auto_apply_corrections: bool = True,
+              llm_proxy: Optional[str] = None) -> Dict[str, Any]:
     """Full pipeline. v0.2: A + C real, B stubbed, D real.
     On verdict=='fail' AND strict=True, returns with strict_failure=True.
     """
     stage_a = stage_a_terminology(text_en, domain)
     stage_b = stage_b_tm_lookup(text_en, domain)
 
-    stage_c = stage_c_llm_draft(text_en, stage_a, stage_b, domain)
+    stage_c = stage_c_llm_draft(text_en, stage_a, stage_b, domain, proxy_name=llm_proxy)
     stage_d = stage_d_validate(stage_c.get("draft_ar", ""), text_en)
 
-    # Simple regen loop (v0.2 — minimal). On 'fail' verdict, retry up to max_regen
-    # times. v0.3 will inject the specific calque hits as negative examples.
+    # Simple regen loop. On 'fail' verdict, retry up to max_regen times.
     regen_count = 0
     while stage_d.get("verdict") == "fail" and regen_count < max_regen and stage_c.get("ok"):
         regen_count += 1
         sys.stderr.write(f"  Validator returned 'fail'; regen attempt {regen_count}/{max_regen}\n")
-        stage_c = stage_c_llm_draft(text_en, stage_a, stage_b, domain)
+        stage_c = stage_c_llm_draft(text_en, stage_a, stage_b, domain, proxy_name=llm_proxy)
         stage_d = stage_d_validate(stage_c.get("draft_ar", ""), text_en)
 
     strict_failure = strict and stage_d.get("verdict") == "fail"
@@ -817,7 +826,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
             stage_e["corrections_applied"] = n_applied
 
     return {
-        "translator_version": "1.1.0",
+        "translator_version": "1.2.0",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
@@ -847,6 +856,8 @@ def main() -> int:
     p.add_argument("--strict", action="store_true",
                    help="Exit non-zero if Stage D validator returns 'fail'")
     p.add_argument("--max-regen", type=int, default=3, help="Max regen attempts on validator fail")
+    p.add_argument("--llm-proxy", choices=["kimi", "codex", "gemini", "minimax"],
+                   help="Stage C: use a LAN-local proxy (no env vars needed). If unset, uses LLM_API_URL/LLM_API_KEY env vars.")
     p.add_argument("--review-with", choices=["kimi", "codex", "gemini", "minimax"],
                    help="Stage E: send the translation through a second LLM proxy for cross-vendor review. "
                         "If correction suggestions come back, auto-applies them (unless --no-auto-correct).")
@@ -867,7 +878,8 @@ def main() -> int:
 
     result = translate(text, args.domain, strict=args.strict, max_regen=args.max_regen,
                        review_with=args.review_with,
-                       auto_apply_corrections=not args.no_auto_correct)
+                       auto_apply_corrections=not args.no_auto_correct,
+                       llm_proxy=args.llm_proxy)
     if args.output:
         Path(args.output).write_text(result["output_ar"], encoding="utf-8")
     if args.json:
