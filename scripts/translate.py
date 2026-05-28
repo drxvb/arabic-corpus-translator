@@ -1,42 +1,60 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-translate.py — CLI for arabic-corpus-translator v0.1.
+translate.py — CLI for arabic-corpus-translator.
 
-v0.1 ships Stage A (terminology lookup) + Stage C (LLM draft, stubbed)
-with Stage B (Translation Memory) and Stage D (Validator) deferred to
-v0.2. The CLI shape is fixed in v0.1 so consumers can wire up the
-invocation pattern without waiting for the full pipeline.
+v0.2 (Option B per references/04-corpus-reality-check.md):
+Ships a working 3-STAGE pipeline:
+  A. Terminology lookup from arabic-corpus-toolkit (real, v0.1)
+  C. LLM draft via OpenAI-compatible endpoint (real, v0.2)
+  D. Calque-rate validator (real, v0.2 — uses toolkit dict as detector)
 
-Usage (current — v0.1):
+Stage B (Translation Memory) remains deferred. The corpus diagnostic
+showed Y:\\Linguistics\\NewsDataForTranslation contains 0 paired
+directories; TM-from-aligned-pairs cannot be built from that data.
+v0.3+ will implement Option A (title-similarity alignment) if it
+proves viable.
+
+Usage:
+    # Set LLM endpoint env vars (any OpenAI-compatible API):
+    export LLM_API_URL=https://api.openai.com/v1/chat/completions
+    export LLM_API_KEY=sk-...
+    export LLM_MODEL=gpt-4o-mini
+
     python translate.py --input article-en.md --domain news --output article-ar.md
+
+    # Analyze-only — show term hints + LLM-free dry run
     python translate.py --analyze --input article-en.md --domain news
 
-Usage (planned — v0.2):
-    python translate.py --input article-en.md --domain news --strict --output article-ar.md
-                                                             # ^^^ fails if validator rejects
+    # Strict mode: fail if validator rejects (calque rate > threshold)
+    python translate.py --strict --input article-en.md --domain news --output out.md
 
-Python 3 stdlib only.
+Python 3 stdlib only (urllib.request for HTTP).
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import sys
+import urllib.request
+import urllib.error
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-# Toolkit resolution: prefer ARABIC_CORPUS_TOOLKIT_ROOT env var, then sibling
-# directory `../arabic-corpus-toolkit`. Same pattern as humanizer v2.7.0.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _TOOLKIT_DEFAULT = _REPO_ROOT.parent / "arabic-corpus-toolkit"
 
+
+# ---------------------------------------------------------------------------
+# Toolkit resolution
+# ---------------------------------------------------------------------------
 
 def _toolkit_root() -> Optional[Path]:
     override = os.environ.get("ARABIC_CORPUS_TOOLKIT_ROOT")
@@ -50,126 +68,284 @@ def _toolkit_root() -> Optional[Path]:
     return None
 
 
-def stage_a_terminology(text_en: str, domain: str) -> Dict[str, Any]:
-    """Stage A: look up known calque corrections from the toolkit.
-
-    Returns a hint object the LLM can use:
-      {
-        "term_hints": [{"en": "...", "natural_ar": "...", "domain": "...", "confidence": "..."}],
-        "topic_guards_active": [...],
-        "matched_count": int
-      }
-    v0.1: rudimentary lookup. v0.2 will integrate context_keywords gating
-    and exclude_if_pattern logic from the toolkit's lookup engine.
-    """
+def _load_calque_entries() -> List[Dict[str, Any]]:
     tk = _toolkit_root()
-    hints: Dict[str, Any] = {"term_hints": [], "topic_guards_active": [], "matched_count": 0}
     if tk is None:
-        hints["warning"] = "toolkit not found; Stage A returned empty hints"
-        return hints
-
-    dict_path = tk / "corpus" / "calque-dictionary.json"
+        return []
+    p = tk / "corpus" / "calque-dictionary.json"
     try:
-        data = json.loads(dict_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        hints["error"] = f"toolkit dictionary unreadable: {e}"
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return data.get("entries", []) if isinstance(data, dict) else data
+
+
+# ---------------------------------------------------------------------------
+# Stage A — Terminology
+# ---------------------------------------------------------------------------
+
+def stage_a_terminology(text_en: str, domain: str) -> Dict[str, Any]:
+    """Look up known calque corrections from the toolkit. Returns LLM-prompt-ready hints."""
+    hints: Dict[str, Any] = {"term_hints": [], "topic_guards_active": [], "matched_count": 0}
+    entries = _load_calque_entries()
+    if not entries:
+        hints["warning"] = "toolkit not found OR dictionary empty"
         return hints
 
-    entries = data.get("entries", []) if isinstance(data, dict) else data
     text_lower = text_en.lower()
     for e in entries:
         en = e.get("en", "")
         if not en:
             continue
-        # Strip parenthetical disambiguation (e.g., "view (database)" -> "view")
         bare_en = en.split("(")[0].strip().lower()
-        if not bare_en:
+        if not bare_en or bare_en not in text_lower:
             continue
-        if bare_en in text_lower:
-            entry_domain = e.get("domain", "")
-            # Domain filter: if the entry's applies_only_in_domain is set,
-            # only fire if the user's domain matches.
-            allowed_domains = e.get("applies_only_in_domain", [])
-            if allowed_domains and domain not in allowed_domains:
-                continue
-            hints["term_hints"].append({
-                "en": en,
-                "natural_ar": e.get("natural_arabic", ""),
-                "ai_default_calque": e.get("ai_default_calque", ""),
-                "domain": entry_domain,
-                "confidence": e.get("confidence", ""),
-                "political_sensitivity": e.get("political_sensitivity"),
-                "disambiguation_warning": e.get("disambiguation_warning"),
-            })
-            if e.get("context_keywords_arabic") or e.get("context_keywords_english"):
-                hints["topic_guards_active"].append(en)
-            hints["matched_count"] += 1
+        allowed_domains = e.get("applies_only_in_domain", [])
+        if allowed_domains and domain not in allowed_domains:
+            continue
+        hints["term_hints"].append({
+            "en": en,
+            "natural_ar": e.get("natural_arabic", ""),
+            "ai_default_calque": e.get("ai_default_calque", ""),
+            "domain": e.get("domain", ""),
+            "confidence": e.get("confidence", ""),
+            "political_sensitivity": e.get("political_sensitivity"),
+            "disambiguation_warning": e.get("disambiguation_warning"),
+        })
+        if e.get("context_keywords_arabic") or e.get("context_keywords_english"):
+            hints["topic_guards_active"].append(en)
+        hints["matched_count"] += 1
     return hints
 
 
-def stage_b_tm_lookup(text_en: str, domain: str) -> Dict[str, Any]:
-    """Stage B: Translation Memory fuzzy-match (v0.2+).
+# ---------------------------------------------------------------------------
+# Stage C — LLM Draft (v0.2 — real implementation)
+# ---------------------------------------------------------------------------
 
-    v0.1 stub. v0.2 will:
-      1. Index Y:\\Linguistics\\NewsDataForTranslation\\_corpus\\parallel\\ into
-         a SQLite FTS5 table with EN and AR columns linked by UUID
-      2. For each input sentence, retrieve the top-K nearest EN matches
-      3. Return EN→AR pairs with similarity score; ≥0.85 = "use directly";
-         0.70-0.85 = "include as LLM hint"; <0.70 = "no useful match"
-    """
-    return {
-        "tm_hits": [],
-        "stub_version": "v0.1",
-        "note": "Stage B is a stub. Translation Memory mining lands in v0.2.",
-    }
+def _build_llm_prompt(text_en: str, term_hints: Dict[str, Any], domain: str) -> Tuple[str, str]:
+    """Return (system_prompt, user_prompt)."""
+    # Build a terminology table the LLM can consult.
+    term_lines: List[str] = []
+    for h in term_hints.get("term_hints", [])[:50]:  # cap at 50 to keep prompt size reasonable
+        warning = ""
+        if h.get("political_sensitivity") in ("high", "critical"):
+            warning = f" ⚠ POLITICAL SENSITIVITY: {h.get('disambiguation_warning', '')[:200]}"
+        term_lines.append(
+            f"- '{h['en']}' → '{h['natural_ar']}' "
+            f"(natural; avoid the AI-default calque '{h.get('ai_default_calque', '?')}'){warning}"
+        )
+    term_block = "\n".join(term_lines) if term_lines else "(no terminology hits)"
+
+    system_prompt = (
+        "You are an Arabic translator producing modern MSA prose for the news/editorial register. "
+        "Strict requirements:\n"
+        "1. Translate to Modern Standard Arabic (MSA). No dialect.\n"
+        "2. Honor the terminology table EXACTLY — use the natural-Arabic forms, NEVER the AI-default calques.\n"
+        "3. Respect political-sensitivity warnings — if an entry is flagged HIGH/CRITICAL, do NOT use the AI default.\n"
+        "4. Output ONLY the Arabic translation — no commentary, no markdown wrappers, no preamble.\n"
+        "5. Preserve the source's paragraph structure.\n"
+        "6. Use Arabic punctuation (، ؛ ؟) in Arabic sentences, not Latin (, ; ?).\n"
+        f"Domain hint: {domain}."
+    )
+
+    user_prompt = (
+        f"# Terminology table (use these forms verbatim):\n{term_block}\n\n"
+        f"# Source text (English):\n{text_en}\n\n"
+        f"# Translate to Arabic:"
+    )
+    return system_prompt, user_prompt
 
 
 def stage_c_llm_draft(text_en: str, term_hints: Dict[str, Any],
                       tm_hints: Dict[str, Any], domain: str) -> Dict[str, Any]:
-    """Stage C: LLM draft using terminology + TM hints (v0.1 stub).
-
-    v0.1 returns a placeholder. v0.2 will invoke the configured LLM
-    endpoint via `LLM_API_URL` / `LLM_API_KEY` / `LLM_MODEL` env vars
-    (same pattern as `arabic-ai-text-humanizer`).
+    """Call the configured LLM endpoint. Returns the AR draft + metadata.
+    Endpoint configured via env vars (same pattern as arabic-ai-text-humanizer):
+      LLM_API_URL, LLM_API_KEY, LLM_MODEL
     """
+    api_url = os.environ.get("LLM_API_URL")
+    api_key = os.environ.get("LLM_API_KEY")
+    model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+
+    if not api_url or not api_key:
+        return {
+            "draft_ar": "[LLM_API_URL or LLM_API_KEY not configured — set env vars to enable Stage C]",
+            "input_en_preview": text_en[:200],
+            "term_hints_count": term_hints.get("matched_count", 0),
+            "tm_hits_count": len(tm_hints.get("tm_hits", [])),
+            "domain": domain,
+            "ok": False,
+            "error": "missing LLM_API_URL or LLM_API_KEY",
+        }
+
+    system_prompt, user_prompt = _build_llm_prompt(text_en, term_hints, domain)
+
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+    }
+    data = json.dumps(body).encode("utf-8")
+
+    req = urllib.request.Request(
+        api_url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return {
+            "draft_ar": "",
+            "ok": False,
+            "error": f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:500]}",
+            "domain": domain,
+        }
+    except (urllib.error.URLError, TimeoutError) as e:
+        return {
+            "draft_ar": "",
+            "ok": False,
+            "error": f"network: {e}",
+            "domain": domain,
+        }
+
+    try:
+        draft = payload["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError) as e:
+        return {
+            "draft_ar": "",
+            "ok": False,
+            "error": f"malformed LLM response: {e}; raw[0:300]: {str(payload)[:300]}",
+            "domain": domain,
+        }
+
     return {
-        "draft_ar": "[STUB OUTPUT — Stage C LLM integration ships in v0.2]",
+        "draft_ar": draft,
         "input_en_preview": text_en[:200],
         "term_hints_count": term_hints.get("matched_count", 0),
         "tm_hits_count": len(tm_hints.get("tm_hits", [])),
         "domain": domain,
-        "stub_version": "v0.1",
+        "model": model,
+        "ok": True,
     }
 
+
+# ---------------------------------------------------------------------------
+# Stage D — Validator (v0.2 — calque-rate metric implemented)
+# ---------------------------------------------------------------------------
 
 def stage_d_validate(draft_ar: str, source_en: str) -> Dict[str, Any]:
-    """Stage D: validator (v0.2+).
-
-    v0.1 stub. v0.2 will implement the three metrics from Agent B's design:
-      - calque_rate: how many natural_arabic entries from the dict appear in draft
-        (higher is better; if their ai_default_calque appears instead, that's a hit)
-      - term_fidelity: % of in-domain terms matching natural_arabic
-      - n_gram_naturalness: corpus-LM perplexity vs `empirical-patterns.json`
-        connector distributions
+    """Score the AR draft on:
+      - calque_rate: how many ai_default_calque entries appear in draft (lower is better)
+      - term_fidelity: how many natural_arabic forms appear (higher is better)
+      - n_gram_naturalness: STUB (deferred to v0.3+ when corpus_stats.py wired in)
     """
+    entries = _load_calque_entries()
+    if not entries:
+        return {
+            "calque_hits": [],
+            "natural_hits": [],
+            "calque_count": 0,
+            "natural_count": 0,
+            "calque_rate_per_1k_tokens": None,
+            "term_fidelity": None,
+            "n_gram_naturalness": None,
+            "verdict": "skipped (toolkit not found)",
+        }
+
+    calque_hits: List[str] = []
+    natural_hits: List[str] = []
+    for e in entries:
+        calque = e.get("ai_default_calque", "").strip()
+        natural = e.get("natural_arabic", "").strip()
+        if calque and calque in draft_ar:
+            calque_hits.append(calque)
+        if natural and natural in draft_ar:
+            natural_hits.append(natural)
+
+    # Crude token count (whitespace-separated)
+    tokens = len(re.findall(r"\S+", draft_ar))
+    calque_rate = (len(calque_hits) * 1000.0 / tokens) if tokens > 0 else 0.0
+    term_fidelity = (
+        len(natural_hits) / (len(natural_hits) + len(calque_hits))
+        if (len(natural_hits) + len(calque_hits)) > 0
+        else 1.0
+    )
+
+    # Verdict — pass if calque rate is low AND term fidelity is high
+    if calque_rate <= 1.0 and term_fidelity >= 0.9:
+        verdict = "pass"
+    elif calque_rate <= 3.0 and term_fidelity >= 0.7:
+        verdict = "warning"
+    else:
+        verdict = "fail"
+
     return {
-        "calque_rate": None,
-        "term_fidelity": None,
-        "n_gram_naturalness": None,
-        "verdict": "stub",
-        "stub_version": "v0.1",
-        "note": "Stage D validator + regen loop lands in v0.2.",
+        "calque_hits": calque_hits[:20],  # cap for readability
+        "natural_hits": natural_hits[:20],
+        "calque_count": len(calque_hits),
+        "natural_count": len(natural_hits),
+        "calque_rate_per_1k_tokens": round(calque_rate, 2),
+        "term_fidelity": round(term_fidelity, 3),
+        "n_gram_naturalness": None,  # deferred to v0.3
+        "verdict": verdict,
+        "thresholds": {
+            "pass": "calque_rate <= 1.0 AND term_fidelity >= 0.9",
+            "warning": "calque_rate <= 3.0 AND term_fidelity >= 0.7",
+        },
     }
 
 
-def translate(text_en: str, domain: str, strict: bool = False) -> Dict[str, Any]:
-    """Full pipeline. v0.1: Stages A + B (stub) + C (stub) + D (stub)."""
+# ---------------------------------------------------------------------------
+# Stage B — Translation Memory (still stubbed pending v0.3 alignment work)
+# ---------------------------------------------------------------------------
+
+def stage_b_tm_lookup(text_en: str, domain: str) -> Dict[str, Any]:
+    """v0.2: still a stub. The SPA corpus diagnostic showed 0 paired
+    directories — alignment via title-similarity (Option A) deferred to
+    v0.3+. See references/04-corpus-reality-check.md."""
+    return {
+        "tm_hits": [],
+        "stub_version": "v0.2",
+        "note": "Stage B is a stub. Corpus alignment requires Option A (title-similarity) work; deferred to v0.3+.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Top-level orchestration
+# ---------------------------------------------------------------------------
+
+def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 3) -> Dict[str, Any]:
+    """Full pipeline. v0.2: A + C real, B stubbed, D real.
+    On verdict=='fail' AND strict=True, returns with strict_failure=True.
+    """
     stage_a = stage_a_terminology(text_en, domain)
     stage_b = stage_b_tm_lookup(text_en, domain)
+
     stage_c = stage_c_llm_draft(text_en, stage_a, stage_b, domain)
-    stage_d = stage_d_validate(stage_c["draft_ar"], text_en)
+    stage_d = stage_d_validate(stage_c.get("draft_ar", ""), text_en)
+
+    # Simple regen loop (v0.2 — minimal). On 'fail' verdict, retry up to max_regen
+    # times. v0.3 will inject the specific calque hits as negative examples.
+    regen_count = 0
+    while stage_d.get("verdict") == "fail" and regen_count < max_regen and stage_c.get("ok"):
+        regen_count += 1
+        sys.stderr.write(f"  Validator returned 'fail'; regen attempt {regen_count}/{max_regen}\n")
+        stage_c = stage_c_llm_draft(text_en, stage_a, stage_b, domain)
+        stage_d = stage_d_validate(stage_c.get("draft_ar", ""), text_en)
+
+    strict_failure = strict and stage_d.get("verdict") == "fail"
+
     return {
-        "translator_version": "0.1.0",
+        "translator_version": "0.2.0",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
@@ -177,23 +353,26 @@ def translate(text_en: str, domain: str, strict: bool = False) -> Dict[str, Any]
             "C_llm_draft": stage_c,
             "D_validator": stage_d,
         },
-        "output_ar": stage_c["draft_ar"],
+        "regen_count": regen_count,
+        "output_ar": stage_c.get("draft_ar", ""),
         "strict_mode": strict,
+        "strict_failure": strict_failure,
     }
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="arabic-corpus-translator v0.1")
+    p = argparse.ArgumentParser(description="arabic-corpus-translator v0.2 — 3-stage pipeline")
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--input", "-i", help="EN text file to translate")
     src.add_argument("--text", "-t", help="EN text inline")
     p.add_argument("--domain", "-d", default="news",
-                   help="Domain hint (news / opinion / business / tech-software / ...). Default: news.")
+                   help="Domain hint. Default: news.")
     p.add_argument("--output", "-o", help="Write AR output to this file")
     p.add_argument("--analyze", action="store_true",
-                   help="Stage A only — list term hints without translating")
+                   help="Stage A only — list term hints without calling LLM")
     p.add_argument("--strict", action="store_true",
-                   help="(v0.2) Fail if Stage D validator rejects the draft")
+                   help="Exit non-zero if Stage D validator returns 'fail'")
+    p.add_argument("--max-regen", type=int, default=3, help="Max regen attempts on validator fail")
     p.add_argument("--json", action="store_true", help="Emit full pipeline result as JSON")
 
     args = p.parse_args()
@@ -207,14 +386,15 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
-    result = translate(text, args.domain, strict=args.strict)
+    result = translate(text, args.domain, strict=args.strict, max_regen=args.max_regen)
     if args.output:
         Path(args.output).write_text(result["output_ar"], encoding="utf-8")
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         print(result["output_ar"])
-    return 0
+
+    return 1 if result.get("strict_failure") else 0
 
 
 if __name__ == "__main__":

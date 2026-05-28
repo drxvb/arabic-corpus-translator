@@ -5,7 +5,13 @@ description: "Corpus-grounded English↔Arabic translation skill. Uses arabic-co
 
 # arabic-corpus-translator — Corpus-Grounded EN↔AR Translation
 
-**Status:** v0.1.1 — honest corpus-state correction + diagnostic. **Architectural pivot pending v0.2.**
+**Status:** v0.2 — **working 3-stage pipeline (Option B from the corpus reality check).**
+
+`scripts/translate.py` ships a real implementation of:
+- **Stage A** (Terminology lookup) — reads toolkit's 340-entry calque dictionary with topic-guard + domain filtering
+- **Stage C** (LLM Draft) — calls any OpenAI-compatible endpoint via `LLM_API_URL` / `LLM_API_KEY` / `LLM_MODEL` env vars; builds a structured prompt that injects the Stage-A term table + political-sensitivity warnings; stdlib `urllib.request` only
+- **Stage D** (Validator) — scores the AR draft on calque-rate-per-1K-tokens + term-fidelity; verdict `pass` / `warning` / `fail`; up to 3 regen attempts on `fail` (configurable)
+- **Stage B** (TM lookup) — remains stubbed; cannot be built from the current SPA corpus (per the v0.1.1 diagnostic). Deferred to v0.3+ via title-similarity alignment (Option A) once viable.
 
 Discovered post-v0.1 ship: the corpus state assumed by Agent B's design **does not match reality.** Ground truth from `scripts/diagnose_corpus.py` (full scan of all 77,756 article directories):
 
