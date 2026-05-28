@@ -394,6 +394,33 @@ def apply_lexical_cleanup(text_ar: str) -> Tuple[str, Dict[str, int]]:
 # Stage A — Terminology
 # ---------------------------------------------------------------------------
 
+# v1.5.0: Asset-influence telemetry adoption (Gap G3). Stage A records every
+# Asset G + Asset A hit via InfluenceTrace if the toolkit's influence_telemetry
+# module is importable. Falls through to legacy behavior otherwise.
+def _asset_g_version(domain: str) -> str:
+    """Read Asset G's current schema_version for the requested domain."""
+    data = _load_domain_terminology(domain)
+    if data is None:
+        return "unknown"
+    return data.get("$schema_version", "unknown")
+
+
+def _new_influence_trace():
+    """Returns a fresh InfluenceTrace if toolkit v1.7.0+ is available; else None.
+    Caller checks for None before recording."""
+    tk = _toolkit_root()
+    if tk is None:
+        return None
+    try:
+        scripts_dir = tk / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from influence_telemetry import InfluenceTrace  # type: ignore
+        return InfluenceTrace()
+    except Exception:
+        return None
+
+
 def stage_a_terminology(text_en: str, domain: str) -> Dict[str, Any]:
     """Look up known calque corrections from the toolkit. Returns LLM-prompt-ready hints.
 
@@ -417,16 +444,32 @@ def stage_a_terminology(text_en: str, domain: str) -> Dict[str, Any]:
     # v0.3.1: scan input EN text for direct Asset G pairs first.
     # v1.0.1: domain-aware -- uses technology pairs for --domain technology,
     # news pairs for --domain news, etc.
+    # v1.5.0: instantiate influence trace (None if toolkit pre-v1.7.0)
+    trace = _new_influence_trace()
+    if trace is not None:
+        hints["_trace"] = trace  # carried through stages; serialized in translate()
+
     g_hits = _find_terminology_pairs_in_text(text_en, domain)
+    asset_g_id = f"G.{domain}"
     for pair in g_hits:
-        hints["asset_g_terminology_hits"].append({
+        hint = {
             "en": pair.get("en"),
             "ar": pair.get("ar"),
             "corpus_freq": pair.get("corpus_freq"),
             "confidence": pair.get("confidence"),
             "proposer": pair.get("proposer"),
             "source": "asset_g_paired_terminology",
-        })
+        }
+        hints["asset_g_terminology_hits"].append(hint)
+        if trace is not None:
+            trace.record(
+                asset_id=asset_g_id,
+                asset_version=_asset_g_version(domain),
+                trigger="term_hint_injected",
+                evidence={"en": pair.get("en"), "ar": pair.get("ar"),
+                          "corpus_freq": pair.get("corpus_freq")},
+                stage="A_terminology",
+            )
 
     entries = _load_calque_entries()
     if not entries:
@@ -905,6 +948,16 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
     # when the asset is missing).
     output_ar = stage_d.get("cleaned_draft_ar") or stage_c.get("draft_ar", "")
 
+    # v1.5.0: serialize influence_trace from Stage A. Future stages can append
+    # to the same trace; for now Stage A is the primary contributor.
+    influence_trace_json: List[Dict[str, Any]] = []
+    trace = stage_a.pop("_trace", None) if isinstance(stage_a, dict) else None
+    if trace is not None:
+        try:
+            influence_trace_json = trace.as_json()
+        except Exception:
+            influence_trace_json = []
+
     # v1.1.0: optional Stage E cross-vendor review
     stage_e = None
     if review_with:
@@ -920,7 +973,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
         stage_f = stage_f_quality_gate(output_ar, register=register, deep=deep_quality)
 
     return {
-        "translator_version": "1.4.0",
+        "translator_version": "1.5.0",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
@@ -933,6 +986,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
         "regen_count": regen_count,
         "output_ar": output_ar,
         "raw_llm_draft_ar": stage_c.get("draft_ar", ""),
+        "influence_trace": influence_trace_json,
         "strict_mode": strict,
         "strict_failure": strict_failure,
     }
