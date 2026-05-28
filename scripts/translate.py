@@ -68,6 +68,10 @@ def _toolkit_disabled() -> bool:
     return os.environ.get("ARABIC_CORPUS_TOOLKIT_DISABLE") == "1"
 
 
+# v1.3.1: warn-once state so we don't spam stderr on repeat calls in same session
+_toolkit_warning_emitted = False
+
+
 def _toolkit_root() -> Optional[Path]:
     if _toolkit_disabled():
         return None
@@ -79,6 +83,23 @@ def _toolkit_root() -> Optional[Path]:
     for c in candidates:
         if (c / "corpus" / "calque-dictionary.json").exists():
             return c
+    # v1.3.1: convert silent fallback to a loud one-shot warning. Sonnet's
+    # evaluator audit flagged this as the most likely production failure mode:
+    # "I cloned the translator to a different directory and everything returns
+    # empty translations with no error. Took me 45 minutes to find the
+    # hardcoded sibling path assumption."
+    global _toolkit_warning_emitted
+    if not _toolkit_warning_emitted:
+        _toolkit_warning_emitted = True
+        sys.stderr.write(
+            f"\n[arabic-corpus-translator] WARNING: arabic-corpus-toolkit not found.\n"
+            f"  Searched: {[str(c) for c in candidates]}\n"
+            f"  Stage A will return empty term hints; Stage D will skip validation.\n"
+            f"  Fix: clone the toolkit as a sibling directory, or set "
+            f"ARABIC_CORPUS_TOOLKIT_ROOT=/path/to/arabic-corpus-toolkit.\n"
+            f"  Suppress this warning by setting ARABIC_CORPUS_TOOLKIT_DISABLE=1 "
+            f"(explicit testing-only mode).\n\n"
+        )
     return None
 
 
@@ -861,7 +882,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
         stage_f = stage_f_quality_gate(output_ar, register=register, deep=deep_quality)
 
     return {
-        "translator_version": "1.3.0",
+        "translator_version": "1.3.1",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
