@@ -275,9 +275,15 @@ def _load_domain_terminology(domain: str = "technology") -> Optional[Dict[str, A
     return data
 
 
-def _find_terminology_pairs_in_text(text_en: str, domain: str = "technology") -> List[Dict[str, Any]]:
+def _find_terminology_pairs_in_text(text_en: str, domain: str = "technology",
+                                    min_consensus: int = 1) -> List[Dict[str, Any]]:
     """Whole-word EN match against Asset G for the given domain.
-    v1.0.1: domain-keyed."""
+    v1.0.1: domain-keyed.
+    v1.8.0: min_consensus filter routed from translate(). Pairs with
+        n_independent_agree < min_consensus are excluded. Pairs missing the
+        field (pre-v1.10.0 assets: G.technology, G.news) pass through
+        unchanged — backward compatible.
+    """
     data = _load_domain_terminology(domain)
     if data is None or not text_en:
         return []
@@ -291,7 +297,13 @@ def _find_terminology_pairs_in_text(text_en: str, domain: str = "technology") ->
             continue
         pattern = r"\b" + re.escape(en) + r"\b"
         if re.search(pattern, text_lower):
-            hits.append(by_en[en])
+            pair = by_en[en]
+            # v1.8.0 min_consensus filter (default=1 preserves prior behavior)
+            n_indep = pair.get("n_independent_agree")
+            if n_indep is not None and n_indep < min_consensus:
+                seen.add(en)
+                continue
+            hits.append(pair)
             seen.add(en)
     return hits
 
@@ -437,7 +449,7 @@ def _new_influence_trace():
         return None
 
 
-def stage_a_terminology(text_en: str, domain: str) -> Dict[str, Any]:
+def stage_a_terminology(text_en: str, domain: str, min_consensus: int = 1) -> Dict[str, Any]:
     """Look up known calque corrections from the toolkit. Returns LLM-prompt-ready hints.
 
     v0.3.0: each hint also carries a corpus_confirmed field via Asset F lookup.
@@ -465,7 +477,7 @@ def stage_a_terminology(text_en: str, domain: str) -> Dict[str, Any]:
     if trace is not None:
         hints["_trace"] = trace  # carried through stages; serialized in translate()
 
-    g_hits = _find_terminology_pairs_in_text(text_en, domain)
+    g_hits = _find_terminology_pairs_in_text(text_en, domain, min_consensus=min_consensus)
     asset_g_id = f"G.{domain}"
     for pair in g_hits:
         hint = {
@@ -984,11 +996,21 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
               auto_apply_corrections: bool = True,
               llm_proxy: Optional[str] = None,
               quality_gate: bool = False,
-              deep_quality: bool = False) -> Dict[str, Any]:
+              deep_quality: bool = False,
+              min_consensus: int = 1) -> Dict[str, Any]:
     """Full pipeline. v0.2: A + C real, B stubbed, D real.
     On verdict=='fail' AND strict=True, returns with strict_failure=True.
+
+    v1.8.0: min_consensus parameter filters Asset G terminology pairs by
+    n_independent_agree (3-vendor cross-validation tier from toolkit v1.10.0+).
+    - min_consensus=1 (default): all pairs that survived at least one
+      independent vendor's approval (preserves pre-v1.10.0 behavior;
+      pairs lacking the field are passed through unchanged).
+    - min_consensus=2: majority consensus (>=2 of 3 independent vendors).
+    - min_consensus=3: unanimous consensus (3 of 3).
+    For consumers wanting only the strongest-validated terminology hints.
     """
-    stage_a = stage_a_terminology(text_en, domain)
+    stage_a = stage_a_terminology(text_en, domain, min_consensus=min_consensus)
     stage_b = stage_b_tm_lookup(text_en, domain)
 
     stage_c = stage_c_llm_draft(text_en, stage_a, stage_b, domain, proxy_name=llm_proxy)
