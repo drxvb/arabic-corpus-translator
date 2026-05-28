@@ -94,6 +94,75 @@ def _load_calque_entries() -> List[Dict[str, Any]]:
     return data.get("entries", []) if isinstance(data, dict) else data
 
 
+# v0.3.0: Asset F (terminology candidates from toolkit v0.8+) -- consumed as
+# a CORPUS-CONFIRMATION signal for Stage A's calque-dictionary recommendations.
+# When the AR translation a calque entry suggests appears in the corpus-mined
+# terminology candidates, stamp the hint with corpus_confirmed=true. This is
+# the trust-signal pattern: don't inject Phase-1 candidates (no EN side) into
+# the LLM prompt directly -- use them to upgrade the confidence of dictionary
+# hits.
+_terminology_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+
+
+def _load_terminology_candidates(domain: str) -> Optional[Dict[str, Any]]:
+    """Load Asset F (Phase 1 candidates) for the given domain. Returns None
+    if the toolkit isn't available, the asset doesn't exist for this domain,
+    or the schema major version is incompatible. mtime-keyed via the cache."""
+    if domain in _terminology_cache:
+        cached = _terminology_cache[domain]
+        # Quick re-check: if cached, verify file mtime hasn't advanced
+        if cached is not None:
+            tk = _toolkit_root()
+            if tk is None:
+                _terminology_cache[domain] = None
+                return None
+            p = tk / "corpus" / f"terminology-candidates-{domain}.json"
+            if p.exists() and p.stat().st_mtime == cached.get("_cached_mtime"):
+                return cached
+        else:
+            return None
+
+    tk = _toolkit_root()
+    if tk is None:
+        _terminology_cache[domain] = None
+        return None
+    p = tk / "corpus" / f"terminology-candidates-{domain}.json"
+    if not p.exists():
+        _terminology_cache[domain] = None
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        _terminology_cache[domain] = None
+        return None
+    schema_major = data.get("$schema_version", "0.0.0").split(".")[0]
+    if schema_major != "1":
+        _terminology_cache[domain] = None
+        return None
+    # Build a frequency-keyed lookup for O(1) term-presence checks
+    by_term: Dict[str, int] = {}
+    for c in data.get("candidates", []):
+        term = c.get("term_ar", "")
+        if term:
+            by_term[term] = c.get("freq", 0)
+    data["_by_term"] = by_term
+    data["_cached_mtime"] = p.stat().st_mtime
+    _terminology_cache[domain] = data
+    return data
+
+
+def _corpus_confirm(term_ar: str, domain: str) -> Optional[Tuple[bool, int]]:
+    """Check if term_ar appears in the Asset F candidates for the given domain.
+    Returns (confirmed_bool, freq) or None if Asset F is not available for this domain."""
+    data = _load_terminology_candidates(domain)
+    if data is None:
+        return None
+    by_term = data.get("_by_term", {})
+    if term_ar in by_term:
+        return (True, by_term[term_ar])
+    return (False, 0)
+
+
 # v0.2.2: Asset C (lexical-tables) integration. Loader + projection mirror the
 # humanizer's v2.7.1 cutover. The translator applies a CONSERVATIVE subset of
 # Asset C in Stage D: only deterministic substitutions (ai_phrases + intensifier
@@ -188,14 +257,30 @@ def apply_lexical_cleanup(text_ar: str) -> Tuple[str, Dict[str, int]]:
 # ---------------------------------------------------------------------------
 
 def stage_a_terminology(text_en: str, domain: str) -> Dict[str, Any]:
-    """Look up known calque corrections from the toolkit. Returns LLM-prompt-ready hints."""
-    hints: Dict[str, Any] = {"term_hints": [], "topic_guards_active": [], "matched_count": 0}
+    """Look up known calque corrections from the toolkit. Returns LLM-prompt-ready hints.
+
+    v0.3.0: each hint also carries a corpus_confirmed field via Asset F lookup.
+    When the suggested natural_ar form is attested in the Phase-1 terminology
+    candidates for this domain (e.g., 'الذكاء الاصطناعي' in the AITNews-mined
+    technology candidates), corpus_confirmed=true and corpus_freq carries the
+    AITNews frequency. This upgrades dictionary recommendations from
+    'dictionary-only' to 'dictionary + corpus-attested.' Hints without corpus
+    confirmation still ship -- they're just flagged for the LLM with lower
+    weight signal.
+    """
+    hints: Dict[str, Any] = {
+        "term_hints": [],
+        "topic_guards_active": [],
+        "matched_count": 0,
+        "asset_f_available": _load_terminology_candidates(domain) is not None,
+    }
     entries = _load_calque_entries()
     if not entries:
         hints["warning"] = "toolkit not found OR dictionary empty"
         return hints
 
     text_lower = text_en.lower()
+    n_corpus_confirmed = 0
     for e in entries:
         en = e.get("en", "")
         if not en:
@@ -206,18 +291,27 @@ def stage_a_terminology(text_en: str, domain: str) -> Dict[str, Any]:
         allowed_domains = e.get("applies_only_in_domain", [])
         if allowed_domains and domain not in allowed_domains:
             continue
-        hints["term_hints"].append({
+        natural_ar = e.get("natural_arabic", "")
+        confirm = _corpus_confirm(natural_ar, domain) if natural_ar else None
+        hint = {
             "en": en,
-            "natural_ar": e.get("natural_arabic", ""),
+            "natural_ar": natural_ar,
             "ai_default_calque": e.get("ai_default_calque", ""),
             "domain": e.get("domain", ""),
             "confidence": e.get("confidence", ""),
             "political_sensitivity": e.get("political_sensitivity"),
             "disambiguation_warning": e.get("disambiguation_warning"),
-        })
+        }
+        if confirm is not None:
+            hint["corpus_confirmed"] = confirm[0]
+            hint["corpus_freq"] = confirm[1]
+            if confirm[0]:
+                n_corpus_confirmed += 1
+        hints["term_hints"].append(hint)
         if e.get("context_keywords_arabic") or e.get("context_keywords_english"):
             hints["topic_guards_active"].append(en)
         hints["matched_count"] += 1
+    hints["corpus_confirmed_count"] = n_corpus_confirmed
     return hints
 
 
@@ -498,7 +592,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
     output_ar = stage_d.get("cleaned_draft_ar") or stage_c.get("draft_ar", "")
 
     return {
-        "translator_version": "0.2.3",
+        "translator_version": "0.3.0",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
