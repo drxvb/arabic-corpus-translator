@@ -148,7 +148,7 @@ def _check_asset_compat(asset_id: str, observed_version: str) -> bool:
         return observed_version.split(".")[0] == "1"
 
 
-def _load_terminology_candidates(domain: str) -> Optional[Dict[str, Any]]:
+def _load_terminology_candidates(domain: str) -> Optional[Dict[str, Any]]:  # asset F
     """Load Asset F (Phase 1 candidates) for the given domain. Returns None
     if the toolkit isn't available, the asset doesn't exist for this domain,
     or the schema major version is incompatible. mtime-keyed via the cache."""
@@ -180,12 +180,12 @@ def _load_terminology_candidates(domain: str) -> Optional[Dict[str, Any]]:
         _terminology_cache[domain] = None
         return None
     observed = data.get("$schema_version", "0.0.0")
-    # v1.4.0: registry-aware compat check (Gap G2). Asset id varies per call;
-    # we pass a generic asset id and let the registry resolve. For terminology-
-    # candidates and domain-terminology, callers pre-declared which asset.
-    # Maintain backward-compat with the legacy major-only refusal as fallback.
-    schema_major = observed.split(".")[0]
-    if schema_major != "1":
+    # v1.6.0: registry-only (removed legacy schema_major hardcoded check).
+    # Gemini + Codex third-audit consensus: "complete asset_registry migration
+    # by removing the three legacy schema_major == '1' loader fallbacks."
+    # _check_asset_compat handles registry-import failure by falling back to
+    # the legacy check internally, so removing the inline check is safe.
+    if not _check_asset_compat(f"F.{domain}", observed):
         _terminology_cache[domain] = None
         return None
     # Build a frequency-keyed lookup for O(1) term-presence checks
@@ -228,7 +228,7 @@ def _domain_terminology_path(tk_root, domain: str) -> Path:
     return tk_root / "corpus" / f"domain-terminology-{domain}.json"
 
 
-def _load_domain_terminology(domain: str = "technology") -> Optional[Dict[str, Any]]:
+def _load_domain_terminology(domain: str = "technology") -> Optional[Dict[str, Any]]:  # asset G
     """Load Asset G for the given domain. Returns None if toolkit not present,
     asset missing, or schema MAJOR version incompatible. Cache keyed by domain.
 
@@ -256,12 +256,12 @@ def _load_domain_terminology(domain: str = "technology") -> Optional[Dict[str, A
         _domain_terminology_cache[domain] = None
         return None
     observed = data.get("$schema_version", "0.0.0")
-    # v1.4.0: registry-aware compat check (Gap G2). Asset id varies per call;
-    # we pass a generic asset id and let the registry resolve. For terminology-
-    # candidates and domain-terminology, callers pre-declared which asset.
-    # Maintain backward-compat with the legacy major-only refusal as fallback.
-    schema_major = observed.split(".")[0]
-    if schema_major != "1":
+    # v1.6.0: registry-only (removed legacy schema_major hardcoded check).
+    # Gemini + Codex third-audit consensus: "complete asset_registry migration
+    # by removing the three legacy schema_major == '1' loader fallbacks."
+    # _check_asset_compat handles registry-import failure by falling back to
+    # the legacy check internally, so removing the inline check is safe.
+    if not _check_asset_compat(f"G.{domain}", observed):
         _domain_terminology_cache[domain] = None
         return None
     by_en: Dict[str, Dict[str, Any]] = {}
@@ -320,13 +320,13 @@ def _load_lexical_tables_from_toolkit() -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     observed = data.get("$schema_version", "0.0.0")
-    # v1.4.0: registry-aware compat check (Gap G2). Asset id varies per call;
-    # we pass a generic asset id and let the registry resolve. For terminology-
-    # candidates and domain-terminology, callers pre-declared which asset.
-    # Maintain backward-compat with the legacy major-only refusal as fallback.
-    schema_major = observed.split(".")[0]
-    if schema_major != "1":
-        return None  # incompatible MAJOR version
+    # v1.6.0: registry-only (removed legacy schema_major hardcoded check).
+    # Gemini + Codex third-audit consensus: "complete asset_registry migration
+    # by removing the three legacy schema_major == '1' loader fallbacks."
+    # _check_asset_compat handles registry-import failure by falling back to
+    # the legacy check internally, so removing the inline check is safe.
+    if not _check_asset_compat("C", observed):
+        return None  # incompatible Asset C version per registry
     return data
 
 
@@ -755,6 +755,26 @@ def stage_c_llm_draft(text_en: str, term_hints: Dict[str, Any],
 # Stage D — Validator (v0.2 — calque-rate metric implemented)
 # ---------------------------------------------------------------------------
 
+# v1.6.0: Stage D adopts toolkit arabic_normalize (G1). Translator's
+# bespoke tokenization (count-by-whitespace + arabic-letter regex) is now
+# normalized through the shared contract for consistent behavior with
+# humanizer's score_text and authoring's humanizer_gate.
+def _stage_d_normalize(text: str) -> str:
+    """Light-level normalization (strip tashkeel + tatweel) via the toolkit's
+    shared contract. Falls back to raw text when toolkit unreachable."""
+    tk = _toolkit_root()
+    if tk is None:
+        return text
+    try:
+        scripts_dir = tk / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from arabic_normalize import normalize  # type: ignore
+        return normalize(text, level="light")
+    except Exception:
+        return text
+
+
 def _arabic_word_boundary_search(needle: str, haystack: str) -> bool:
     """v0.2.1: Word-boundary-aware substring search for Arabic text.
 
@@ -797,9 +817,9 @@ def stage_d_validate(draft_ar: str, source_en: str) -> Dict[str, Any]:
     (toolkit pre-v0.7 or missing entirely), behavior matches v0.2.1.
     """
     cleaned_draft, cleanup_diag = apply_lexical_cleanup(draft_ar)
-    # If anything was applied, validate the CLEANED text; otherwise validate
-    # the original draft (semantically identical).
-    text_to_score = cleaned_draft
+    # v1.6.0: route Stage D scoring through shared arabic_normalize (G1).
+    # If anything was cleaned, validate the cleaned + normalized text.
+    text_to_score = _stage_d_normalize(cleaned_draft)
 
     entries = _load_calque_entries()
     if not entries:
@@ -973,7 +993,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
         stage_f = stage_f_quality_gate(output_ar, register=register, deep=deep_quality)
 
     return {
-        "translator_version": "1.5.0",
+        "translator_version": "1.6.0",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
