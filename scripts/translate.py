@@ -330,7 +330,8 @@ def _load_lexical_tables_from_toolkit() -> Optional[Dict[str, Any]]:
     return data
 
 
-def apply_lexical_cleanup(text_ar: str) -> Tuple[str, Dict[str, int]]:
+def apply_lexical_cleanup(text_ar: str,
+                          trace=None) -> Tuple[str, Dict[str, int]]:
     """Apply the deterministic subset of Asset C to a translated draft.
 
     Applies:
@@ -371,6 +372,14 @@ def apply_lexical_cleanup(text_ar: str) -> Tuple[str, Dict[str, int]]:
             count = text_ar.count(needle)
             text_ar = text_ar.replace(needle, replacement)
             diag["ai_phrases_applied"] += count
+            # v1.7.0: per-substitution telemetry (G3 Stage D coverage)
+            if trace is not None:
+                trace.record(
+                    asset_id="C", asset_version="1.1.0",
+                    trigger="lex_substitution_fired",
+                    evidence={"phrase": needle, "replacement": replacement, "count": count},
+                    stage="D_validator",
+                )
 
     # intensifier_destack: regex patterns, applied in declaration order
     destack_entries = tables.get("intensifier_destack", {}).get("entries", [])
@@ -384,6 +393,13 @@ def apply_lexical_cleanup(text_ar: str) -> Tuple[str, Dict[str, int]]:
             if n:
                 text_ar = new_text
                 diag["intensifier_destack_applied"] += n
+                if trace is not None:
+                    trace.record(
+                        asset_id="C", asset_version="1.1.0",
+                        trigger="intensifier_destacked",
+                        evidence={"pattern": pattern, "replacement": replacement, "count": n},
+                        stage="D_validator",
+                    )
         except re.error:
             continue
 
@@ -569,7 +585,8 @@ _REVIEW_PROXIES = {
 
 def stage_e_cross_vendor_review(text_en: str, draft_ar: str,
                                  term_hints: Dict[str, Any],
-                                 reviewer: str = "codex") -> Dict[str, Any]:
+                                 reviewer: str = "codex",
+                                 trace=None) -> Dict[str, Any]:
     """Send source + draft to a second LLM proxy for cross-vendor review.
     Returns {available, verdict, corrections, raw_response}.
     Verdicts: 'pass' (faithful translation), 'minor_issues' (small fixes
@@ -634,11 +651,21 @@ def stage_e_cross_vendor_review(text_en: str, draft_ar: str,
         return {"available": True, "verdict": "review_failed",
                 "corrections": [], "error": "could not parse JSON",
                 "raw_response": content[:500], "reviewer": reviewer}
+    corrections = parsed.get("corrections", [])
+    # v1.7.0: record cross-vendor correction (G3 Stage E coverage)
+    if trace is not None:
+        trace.record(
+            asset_id="translator", asset_version="1.7.0",
+            trigger="cross_vendor_correction",
+            evidence={"reviewer": reviewer, "verdict": parsed.get("verdict"),
+                      "n_corrections_proposed": len(corrections)},
+            stage="E_cross_vendor_review",
+        )
     return {
         "available": True,
         "reviewer": reviewer,
         "verdict": parsed.get("verdict", "review_failed"),
-        "corrections": parsed.get("corrections", []),
+        "corrections": corrections,
         "raw_response": content[:1000],
     }
 
@@ -799,7 +826,8 @@ def _arabic_word_boundary_search(needle: str, haystack: str) -> bool:
     return re.search(pat, haystack) is not None
 
 
-def stage_d_validate(draft_ar: str, source_en: str) -> Dict[str, Any]:
+def stage_d_validate(draft_ar: str, source_en: str,
+                      trace=None) -> Dict[str, Any]:
     """Score the AR draft on:
       - calque_rate: how many ai_default_calque entries appear (word-boundary safe)
       - term_fidelity: how many natural_arabic forms appear (word-boundary safe)
@@ -816,7 +844,8 @@ def stage_d_validate(draft_ar: str, source_en: str) -> Dict[str, Any]:
     returned dict report what happened. If Asset C isn't available
     (toolkit pre-v0.7 or missing entirely), behavior matches v0.2.1.
     """
-    cleaned_draft, cleanup_diag = apply_lexical_cleanup(draft_ar)
+    # v1.7.0: thread trace into lex cleanup (G3 Stage D coverage)
+    cleaned_draft, cleanup_diag = apply_lexical_cleanup(draft_ar, trace=trace)
     # v1.6.0: route Stage D scoring through shared arabic_normalize (G1).
     # If anything was cleaned, validate the cleaned + normalized text.
     text_to_score = _stage_d_normalize(cleaned_draft)
@@ -915,7 +944,8 @@ def stage_b_tm_lookup(text_en: str, domain: str) -> Dict[str, Any]:
 # cognitive rubric. Pass-through if humanizer not importable.
 def stage_f_quality_gate(text_ar: str, register: str = "news",
                           proxy_name: str = "gemini",
-                          deep: bool = False) -> Dict[str, Any]:
+                          deep: bool = False,
+                          trace=None) -> Dict[str, Any]:
     """Score final output via humanizer. Heuristic if deep=False; LLM-backed if deep=True.
     Returns {available, score, backend, ...}. Pass-through if humanizer absent."""
     repo_root = os.environ.get("ARABIC_HUMANIZER_ROOT") or str(
@@ -929,10 +959,22 @@ def stage_f_quality_gate(text_ar: str, register: str = "news",
             sys.path.insert(0, str(h_scripts))
         if deep:
             from humanize_v2 import score_text_deep  # type: ignore
-            return score_text_deep(text_ar, register=register, proxy_name=proxy_name)
+            result = score_text_deep(text_ar, register=register, proxy_name=proxy_name)
         else:
             from humanize_v2 import score_text  # type: ignore
-            return score_text(text_ar, register=register)
+            result = score_text(text_ar, register=register)
+        # v1.7.0: record humanizer-gate decision (G3 Stage F coverage)
+        if trace is not None:
+            trace.record(
+                asset_id="humanizer", asset_version="2.15.0",
+                trigger="humanizer_gate_decision",
+                evidence={"score": result.get("score"),
+                          "backend": result.get("backend"),
+                          "fallback_used": result.get("fallback_used"),
+                          "deep": deep},
+                stage="F_quality_gate",
+            )
+        return result
     except Exception as e:
         return {"available": False, "error": str(e)}
 
@@ -950,7 +992,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
     stage_b = stage_b_tm_lookup(text_en, domain)
 
     stage_c = stage_c_llm_draft(text_en, stage_a, stage_b, domain, proxy_name=llm_proxy)
-    stage_d = stage_d_validate(stage_c.get("draft_ar", ""), text_en)
+    stage_d = stage_d_validate(stage_c.get("draft_ar", ""), text_en, trace=stage_a.get("_trace"))
 
     # Simple regen loop. On 'fail' verdict, retry up to max_regen times.
     regen_count = 0
@@ -958,7 +1000,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
         regen_count += 1
         sys.stderr.write(f"  Validator returned 'fail'; regen attempt {regen_count}/{max_regen}\n")
         stage_c = stage_c_llm_draft(text_en, stage_a, stage_b, domain, proxy_name=llm_proxy)
-        stage_d = stage_d_validate(stage_c.get("draft_ar", ""), text_en)
+        stage_d = stage_d_validate(stage_c.get("draft_ar", ""), text_en, trace=stage_a.get("_trace"))
 
     strict_failure = strict and stage_d.get("verdict") == "fail"
 
@@ -981,7 +1023,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
     # v1.1.0: optional Stage E cross-vendor review
     stage_e = None
     if review_with:
-        stage_e = stage_e_cross_vendor_review(text_en, output_ar, stage_a, reviewer=review_with)
+        stage_e = stage_e_cross_vendor_review(text_en, output_ar, stage_a, reviewer=review_with, trace=stage_a.get("_trace"))
         if auto_apply_corrections and stage_e.get("corrections"):
             output_ar, n_applied = apply_cross_vendor_corrections(output_ar, stage_e["corrections"])
             stage_e["corrections_applied"] = n_applied
@@ -990,10 +1032,10 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
     stage_f = None
     if quality_gate:
         register = "news"  # could be domain-derived in future
-        stage_f = stage_f_quality_gate(output_ar, register=register, deep=deep_quality)
+        stage_f = stage_f_quality_gate(output_ar, register=register, deep=deep_quality, trace=stage_a.get("_trace"))
 
     return {
-        "translator_version": "1.6.0",
+        "translator_version": "1.7.0",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
