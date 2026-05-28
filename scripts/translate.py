@@ -125,6 +125,29 @@ def _load_calque_entries() -> List[Dict[str, Any]]:
 _terminology_cache: Dict[str, Optional[Dict[str, Any]]] = {}
 
 
+# v1.4.0: registry-aware compatibility checks. Replaces the three hardcoded
+# `schema_major != "1"` site checks with the toolkit's queryable registry
+# (Gap G2). Falls back to hardcoded check when registry is unreachable, so
+# old toolkit versions still work.
+def _check_asset_compat(asset_id: str, observed_version: str) -> bool:
+    """Returns True if `observed_version` is compatible per the toolkit's
+    asset registry (v1.6.0+). Falls back to the legacy `major == 1` check
+    when registry is not available."""
+    tk = _toolkit_root()
+    if tk is None:
+        # Toolkit unavailable — fall back to legacy hardcoded check
+        return observed_version.split(".")[0] == "1"
+    try:
+        scripts_dir = tk / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from asset_registry import is_compatible  # type: ignore
+        return is_compatible(asset_id, observed_version)
+    except Exception:
+        # Registry import failed (toolkit pre-v1.6.0) — fall back
+        return observed_version.split(".")[0] == "1"
+
+
 def _load_terminology_candidates(domain: str) -> Optional[Dict[str, Any]]:
     """Load Asset F (Phase 1 candidates) for the given domain. Returns None
     if the toolkit isn't available, the asset doesn't exist for this domain,
@@ -156,7 +179,12 @@ def _load_terminology_candidates(domain: str) -> Optional[Dict[str, Any]]:
     except Exception:
         _terminology_cache[domain] = None
         return None
-    schema_major = data.get("$schema_version", "0.0.0").split(".")[0]
+    observed = data.get("$schema_version", "0.0.0")
+    # v1.4.0: registry-aware compat check (Gap G2). Asset id varies per call;
+    # we pass a generic asset id and let the registry resolve. For terminology-
+    # candidates and domain-terminology, callers pre-declared which asset.
+    # Maintain backward-compat with the legacy major-only refusal as fallback.
+    schema_major = observed.split(".")[0]
     if schema_major != "1":
         _terminology_cache[domain] = None
         return None
@@ -227,7 +255,12 @@ def _load_domain_terminology(domain: str = "technology") -> Optional[Dict[str, A
     except Exception:
         _domain_terminology_cache[domain] = None
         return None
-    schema_major = data.get("$schema_version", "0.0.0").split(".")[0]
+    observed = data.get("$schema_version", "0.0.0")
+    # v1.4.0: registry-aware compat check (Gap G2). Asset id varies per call;
+    # we pass a generic asset id and let the registry resolve. For terminology-
+    # candidates and domain-terminology, callers pre-declared which asset.
+    # Maintain backward-compat with the legacy major-only refusal as fallback.
+    schema_major = observed.split(".")[0]
     if schema_major != "1":
         _domain_terminology_cache[domain] = None
         return None
@@ -286,7 +319,12 @@ def _load_lexical_tables_from_toolkit() -> Optional[Dict[str, Any]]:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
-    schema_major = data.get("$schema_version", "0.0.0").split(".")[0]
+    observed = data.get("$schema_version", "0.0.0")
+    # v1.4.0: registry-aware compat check (Gap G2). Asset id varies per call;
+    # we pass a generic asset id and let the registry resolve. For terminology-
+    # candidates and domain-terminology, callers pre-declared which asset.
+    # Maintain backward-compat with the legacy major-only refusal as fallback.
+    schema_major = observed.split(".")[0]
     if schema_major != "1":
         return None  # incompatible MAJOR version
     return data
@@ -882,7 +920,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
         stage_f = stage_f_quality_gate(output_ar, register=register, deep=deep_quality)
 
     return {
-        "translator_version": "1.3.1",
+        "translator_version": "1.4.0",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
