@@ -1,0 +1,25 @@
+{
+  "root": "Y:\\Linguistics\\NewsDataForTranslation",
+  "scanned_dirs": 77756,
+  "skipped_non_article_dirs": 4,
+  "file_layout": {
+    "en_only": 38897,
+    "ar_only": 38859
+  },
+  "translations_resolved": {
+    "en_side": 0,
+    "ar_side": 11
+  },
+  "translations_unresolved": {
+    "en_side": 162,
+    "ar_side": 56
+  },
+  "translations_empty": {
+    "en_side": 38,
+    "ar_side": 133
+  },
+  "translations_sample_size_each_side": 200,
+  "sample_warnings": [],
+  "estimated_alignable_en_pairs": 0,
+  "estimated_resolved_rate_en": 0.0
+}

@@ -2,7 +2,17 @@
 
 > Corpus-grounded EN↔AR translation skill. Uses `arabic-corpus-toolkit` as its terminology base. Four-stage pipeline: terminology → Translation Memory → LLM draft → quality validator. RTL/Arabic-first.
 
-**Status:** v0.1 scaffold (architecture + CLI shape). Stages B (TM) and D (Validator) are stubs pending v0.2 mining work.
+**Status:** v0.1.1 — honest corpus-state correction.
+
+**Important:** v0.1 claimed the corpus had "38,886 UUID-aligned EN/AR pairs ready." A post-ship diagnostic (`scripts/diagnose_corpus.py`, full scan of all 77,756 article dirs) found that's **NOT the case**:
+
+- **0 paired dirs** (no en.json + ar.json co-located)
+- **38,897 EN-only + 38,859 AR-only** (disjoint monolingual collections)
+- **~0% cross-reference resolution** on EN-side (0/200 sampled)
+- **~5.5%** on AR-side (11/200)
+- `_corpus/parallel/*.jsonl` files are **0 KB** (placeholders, not populated)
+
+The corpus is real and valuable as **monolingual reference data**, but the EN↔AR alignment Agent B's design assumed doesn't exist in the source. v0.2 will pivot to title-similarity alignment OR drop Stage B and ship as a 3-stage pipeline. See `references/04-corpus-reality-check.md` and `SKILL.md` for the revised plan.
 
 ## Why
 

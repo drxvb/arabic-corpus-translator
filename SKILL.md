@@ -5,7 +5,26 @@ description: "Corpus-grounded English↔Arabic translation skill. Uses arabic-co
 
 # arabic-corpus-translator — Corpus-Grounded EN↔AR Translation
 
-**Status:** v0.1 — architecture scaffold + CLI shape. Stages B (TM) and D (Validator) are stubs pending the v0.2 mining work on `Y:\Linguistics\NewsDataForTranslation` (38,886 SPA bilingual article pairs already aligned by UUID).
+**Status:** v0.1.1 — honest corpus-state correction + diagnostic. **Architectural pivot pending v0.2.**
+
+Discovered post-v0.1 ship: the corpus state assumed by Agent B's design **does not match reality.** Ground truth from `scripts/diagnose_corpus.py` (full scan of all 77,756 article directories):
+
+| Layout | Actual count |
+|---|---|
+| EN-only directories | **38,897** |
+| AR-only directories | **38,859** |
+| Paired (both en.json + ar.json) | **0** |
+| Resolvable EN→AR cross-references | ~0% (0/200 in random sample) |
+| Resolvable AR→EN cross-references | ~5.5% (11/200 in random sample) |
+| `_corpus/parallel/spa_parallel.jsonl` (pre-built index) | **0 KB — empty** |
+
+**What this means architecturally:**
+- The `_corpus/parallel/` pre-built alignment files are empty placeholders, not populated data
+- The `translations: [{uuid, locale}]` cross-reference field in en.json points to UUIDs that aren't in the dataset
+- The corpus is effectively **two disjoint monolingual collections** with broken cross-references
+- Stage B (TM lookup against 38,886 pairs) **cannot be built from this corpus as-is**
+
+The 38,897 EN + 38,859 AR articles ARE valuable as **monolingual reference data** (for Stage D n-gram naturalness scoring + register learning + terminology mining), but not for direct alignment.
 
 ## Why this skill exists
 
@@ -57,12 +76,29 @@ OUTPUT (AR text) + provenance per span
 - `references/02-architecture.md` — full per-stage design notes
 - `references/03-eval-strategy.md` — how the "better than corpus baseline" claim becomes measurable (calque-rate reduction ≥60% vs GPT-4o-class baseline; term-fidelity ≥90%; n-gram perplexity within 1 stddev of human-written news)
 
-## v0.2 deferred
+## v0.2 plan (REVISED post-diagnostic)
 
-- Stage B: mine `Y:\Linguistics\NewsDataForTranslation\_corpus\parallel\` (38,886 UUID-aligned pairs already exists — pre-mining done) into a SQLite FTS5 index for fuzzy lookup
+Three options for Stage B given the corpus reality:
+
+### Option A — Title-similarity alignment (recommended)
+
+Build EN↔AR pairs by fuzzy-matching article titles across the two monolingual collections. Estimated yield: **5-15% pair rate** (~2K-6K usable pairs). Lower than Agent B assumed, but still meaningful seed data.
+
+Pipeline: extract title+date+category from each en.json and ar.json → embed with a multilingual model (LaBSE / multilingual-E5) → top-K nearest cross-language match within ±3-day publication window → confidence-filtered.
+
+### Option B — Drop Stage B (simpler, honest)
+
+Ship the v0.2 translator as **3-stage** (Terminology + LLM Draft + Validator). Skip TM entirely. Simpler, still useful. The monolingual corpora feed Stage D (n-gram naturalness) instead of Stage B.
+
+### Option C — Monolingual-only mining
+
+Build per-language n-gram language models from the 38K+ EN articles and 38K+ AR articles. Use them in Stage D for fluency scoring. No Stage B; Stage D becomes more sophisticated.
+
+### Other v0.2 work (unchanged from v0.1 plan)
+
 - Stage D: implement calque-rate + term-fidelity + n-gram naturalness scoring
-- Adversarial eval set: curate 200 sentences where AI is known to fail (user's frustration cases)
-- LLM backend integration: provider-agnostic via the same `LLM_API_URL`/`LLM_API_KEY`/`LLM_MODEL` pattern as `arabic-ai-text-humanizer`
+- Adversarial eval set: curate 200 sentences where AI is known to fail
+- LLM backend integration: provider-agnostic via `LLM_API_URL`/`LLM_API_KEY`/`LLM_MODEL`
 
 ## Dependencies
 
