@@ -56,7 +56,21 @@ _TOOLKIT_DEFAULT = _REPO_ROOT.parent / "arabic-corpus-toolkit"
 # Toolkit resolution
 # ---------------------------------------------------------------------------
 
+def _toolkit_disabled() -> bool:
+    """v0.2.3: explicit kill-switch matching humanizer v2.7.2 semantics.
+
+    Set ARABIC_CORPUS_TOOLKIT_DISABLE=1 (the literal string '1', not 'true'
+    or 'yes') to skip toolkit loading. Stage A returns empty term hints,
+    Stage D returns 'skipped (toolkit not found)', Stage C runs normally.
+    Useful for isolating the toolkit's contribution when debugging output
+    differences. Strict literal match -- DEBUG=1 convention.
+    """
+    return os.environ.get("ARABIC_CORPUS_TOOLKIT_DISABLE") == "1"
+
+
 def _toolkit_root() -> Optional[Path]:
+    if _toolkit_disabled():
+        return None
     override = os.environ.get("ARABIC_CORPUS_TOOLKIT_ROOT")
     candidates: List[Path] = []
     if override:
@@ -484,7 +498,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
     output_ar = stage_d.get("cleaned_draft_ar") or stage_c.get("draft_ar", "")
 
     return {
-        "translator_version": "0.2.2",
+        "translator_version": "0.2.3",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
