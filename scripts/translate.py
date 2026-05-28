@@ -163,6 +163,77 @@ def _corpus_confirm(term_ar: str, domain: str) -> Optional[Tuple[bool, int]]:
     return (False, 0)
 
 
+# v0.3.1: Asset G (domain-terminology paired EN<->AR terms from toolkit v0.9+).
+# Direct EN-pair injection in Stage A: when the input text contains an EN term
+# that's in Asset G, inject the AR translation as a direct hint to the LLM.
+# Asset G is COMPLEMENTARY to the calque dictionary (Asset A): A catalogs AI
+# errors, G catalogs standard terminology. Both inject; dedup at output time.
+_domain_terminology_cache: Optional[Dict[str, Any]] = None
+_domain_terminology_mtime: Optional[float] = None
+
+
+def _load_domain_terminology() -> Optional[Dict[str, Any]]:
+    """Load Asset G. Returns None if toolkit not present, asset missing, or
+    schema MAJOR version incompatible. Single-domain for now (technology);
+    future v0.3.2 may key by domain."""
+    global _domain_terminology_cache, _domain_terminology_mtime
+    tk = _toolkit_root()
+    if tk is None:
+        _domain_terminology_cache = None
+        _domain_terminology_mtime = None
+        return None
+    p = tk / "corpus" / "domain-terminology.json"
+    if not p.exists():
+        _domain_terminology_cache = None
+        _domain_terminology_mtime = None
+        return None
+    mtime = p.stat().st_mtime
+    if _domain_terminology_cache is not None and _domain_terminology_mtime == mtime:
+        return _domain_terminology_cache
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        _domain_terminology_cache = None
+        _domain_terminology_mtime = None
+        return None
+    schema_major = data.get("$schema_version", "0.0.0").split(".")[0]
+    if schema_major != "1":
+        _domain_terminology_cache = None
+        return None
+    # Index by lowercase EN for whole-word matching
+    by_en: Dict[str, Dict[str, Any]] = {}
+    for pair in data.get("pairs", []):
+        en = pair.get("en", "").strip().lower()
+        if en:
+            by_en[en] = pair
+    data["_by_en"] = by_en
+    _domain_terminology_cache = data
+    _domain_terminology_mtime = mtime
+    return data
+
+
+def _find_terminology_pairs_in_text(text_en: str) -> List[Dict[str, Any]]:
+    """Whole-word EN match against Asset G. Returns matched pairs."""
+    data = _load_domain_terminology()
+    if data is None or not text_en:
+        return []
+    text_lower = text_en.lower()
+    by_en = data.get("_by_en", {})
+    hits: List[Dict[str, Any]] = []
+    seen: set = set()  # dedup by EN string
+    # Sort by EN length desc so multi-word terms match before substrings
+    sorted_ens = sorted(by_en.keys(), key=len, reverse=True)
+    for en in sorted_ens:
+        if en in seen:
+            continue
+        # Whole-word match
+        pattern = r"\b" + re.escape(en) + r"\b"
+        if re.search(pattern, text_lower):
+            hits.append(by_en[en])
+            seen.add(en)
+    return hits
+
+
 # v0.2.2: Asset C (lexical-tables) integration. Loader + projection mirror the
 # humanizer's v2.7.1 cutover. The translator applies a CONSERVATIVE subset of
 # Asset C in Stage D: only deterministic substitutions (ai_phrases + intensifier
@@ -273,7 +344,24 @@ def stage_a_terminology(text_en: str, domain: str) -> Dict[str, Any]:
         "topic_guards_active": [],
         "matched_count": 0,
         "asset_f_available": _load_terminology_candidates(domain) is not None,
+        "asset_g_available": _load_domain_terminology() is not None,
+        "asset_g_terminology_hits": [],
     }
+    # v0.3.1: scan input EN text for direct Asset G pairs first. These are
+    # corpus-grounded EN<->AR pairs whose role is "standard terminology"
+    # (vs Asset A's "AI error catalog"). The LLM gets BOTH sets injected
+    # for prompts where terms appear in both.
+    g_hits = _find_terminology_pairs_in_text(text_en)
+    for pair in g_hits:
+        hints["asset_g_terminology_hits"].append({
+            "en": pair.get("en"),
+            "ar": pair.get("ar"),
+            "corpus_freq": pair.get("corpus_freq"),
+            "confidence": pair.get("confidence"),
+            "proposer": pair.get("proposer"),
+            "source": "asset_g_paired_terminology",
+        })
+
     entries = _load_calque_entries()
     if not entries:
         hints["warning"] = "toolkit not found OR dictionary empty"
@@ -592,7 +680,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
     output_ar = stage_d.get("cleaned_draft_ar") or stage_c.get("draft_ar", "")
 
     return {
-        "translator_version": "0.3.0",
+        "translator_version": "0.3.1",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
