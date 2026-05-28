@@ -80,6 +80,95 @@ def _load_calque_entries() -> List[Dict[str, Any]]:
     return data.get("entries", []) if isinstance(data, dict) else data
 
 
+# v0.2.2: Asset C (lexical-tables) integration. Loader + projection mirror the
+# humanizer's v2.7.1 cutover. The translator applies a CONSERVATIVE subset of
+# Asset C in Stage D: only deterministic substitutions (ai_phrases + intensifier
+# de-stack). Probabilistic / variance-introducing tables (connectors with
+# probability 0.7, quote-verb rotation, repetitive-starter detection, intensity-
+# gated fillers) are deliberately NOT applied — the translator's contract is
+# reproducibility, not the humanizer's "introduce variance for humanness."
+
+def _load_lexical_tables_from_toolkit() -> Optional[Dict[str, Any]]:
+    """Read Asset C from the toolkit. Returns None on any failure
+    (file missing, parse error, schema-major mismatch)."""
+    tk = _toolkit_root()
+    if tk is None:
+        return None
+    # Toolkit may be present (calque-dictionary.json) but Asset C may be older
+    # — Asset C only shipped in toolkit v0.7+. Check explicitly.
+    p = tk / "corpus" / "lexical-tables.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    schema_major = data.get("$schema_version", "0.0.0").split(".")[0]
+    if schema_major != "1":
+        return None  # incompatible MAJOR version
+    return data
+
+
+def apply_lexical_cleanup(text_ar: str) -> Tuple[str, Dict[str, int]]:
+    """Apply the deterministic subset of Asset C to a translated draft.
+
+    Applies:
+      - ai_phrases: substitute with the FIRST non-empty alternative (deterministic
+        — no random choice. If all alternatives are empty, deletes the phrase).
+      - intensifier_destack: regex substitution for stacked intensifiers.
+
+    Skips: connectors (probabilistic), quote_verbs (rotation), repetitive_starters
+    (consecutive-trigger needs sentence-pair tracking), fillers (intensity-gated
+    is humanizer-specific), structural_openers (regex capture+template risks
+    over-substitution in translation context).
+
+    Returns (cleaned_text, diagnostics_dict).
+    """
+    data = _load_lexical_tables_from_toolkit()
+    diag: Dict[str, int] = {
+        "ai_phrases_applied": 0,
+        "intensifier_destack_applied": 0,
+        "asset_available": 0,
+    }
+    if data is None:
+        return text_ar, diag
+    diag["asset_available"] = 1
+    tables = data.get("tables", {})
+
+    # ai_phrases: longest-key-first to avoid sub-string interference
+    # (e.g. "من المهم ملاحظة أن" must match before bare "من المهم ملاحظة").
+    ai_entries = tables.get("ai_phrases", {}).get("entries", [])
+    sorted_ai = sorted(ai_entries, key=lambda e: len(e.get("input", "")), reverse=True)
+    for entry in sorted_ai:
+        needle = entry.get("input", "")
+        alternatives = entry.get("alternatives", [])
+        if not needle or not alternatives:
+            continue
+        # Deterministic choice: first non-empty alternative, else empty (delete)
+        replacement = next((a for a in alternatives if a), "")
+        if needle in text_ar:
+            count = text_ar.count(needle)
+            text_ar = text_ar.replace(needle, replacement)
+            diag["ai_phrases_applied"] += count
+
+    # intensifier_destack: regex patterns, applied in declaration order
+    destack_entries = tables.get("intensifier_destack", {}).get("entries", [])
+    for entry in destack_entries:
+        pattern = entry.get("pattern", "")
+        replacement = entry.get("replacement", "")
+        if not pattern:
+            continue
+        try:
+            new_text, n = re.subn(pattern, replacement, text_ar)
+            if n:
+                text_ar = new_text
+                diag["intensifier_destack_applied"] += n
+        except re.error:
+            continue
+
+    return text_ar, diag
+
+
 # ---------------------------------------------------------------------------
 # Stage A — Terminology
 # ---------------------------------------------------------------------------
@@ -275,7 +364,19 @@ def stage_d_validate(draft_ar: str, source_en: str) -> Dict[str, Any]:
     v0.2.1: switched from naive `in` substring match to word-boundary
     regex to eliminate false positives like `بيان` matching inside
     `البيانات`. Same fix pattern as humanizer v2.4.5.
+
+    v0.2.2: Asset C lexical-cleanup applied BEFORE scoring. If the LLM
+    produced AI-tell phrases (e.g., 'من المهم ملاحظة') and Asset C can
+    fix them deterministically, we apply the fix and score the cleaned
+    draft. The 'cleaned_draft_ar' and 'lexical_cleanup' fields in the
+    returned dict report what happened. If Asset C isn't available
+    (toolkit pre-v0.7 or missing entirely), behavior matches v0.2.1.
     """
+    cleaned_draft, cleanup_diag = apply_lexical_cleanup(draft_ar)
+    # If anything was applied, validate the CLEANED text; otherwise validate
+    # the original draft (semantically identical).
+    text_to_score = cleaned_draft
+
     entries = _load_calque_entries()
     if not entries:
         return {
@@ -287,6 +388,8 @@ def stage_d_validate(draft_ar: str, source_en: str) -> Dict[str, Any]:
             "term_fidelity": None,
             "n_gram_naturalness": None,
             "verdict": "skipped (toolkit not found)",
+            "cleaned_draft_ar": cleaned_draft,
+            "lexical_cleanup": cleanup_diag,
         }
 
     calque_hits: List[str] = []
@@ -294,13 +397,13 @@ def stage_d_validate(draft_ar: str, source_en: str) -> Dict[str, Any]:
     for e in entries:
         calque = e.get("ai_default_calque", "").strip()
         natural = e.get("natural_arabic", "").strip()
-        if calque and _arabic_word_boundary_search(calque, draft_ar):
+        if calque and _arabic_word_boundary_search(calque, text_to_score):
             calque_hits.append(calque)
-        if natural and _arabic_word_boundary_search(natural, draft_ar):
+        if natural and _arabic_word_boundary_search(natural, text_to_score):
             natural_hits.append(natural)
 
     # Crude token count (whitespace-separated)
-    tokens = len(re.findall(r"\S+", draft_ar))
+    tokens = len(re.findall(r"\S+", text_to_score))
     calque_rate = (len(calque_hits) * 1000.0 / tokens) if tokens > 0 else 0.0
     term_fidelity = (
         len(natural_hits) / (len(natural_hits) + len(calque_hits))
@@ -329,6 +432,8 @@ def stage_d_validate(draft_ar: str, source_en: str) -> Dict[str, Any]:
             "pass": "calque_rate <= 1.0 AND term_fidelity >= 0.9",
             "warning": "calque_rate <= 3.0 AND term_fidelity >= 0.7",
         },
+        "cleaned_draft_ar": cleaned_draft,
+        "lexical_cleanup": cleanup_diag,
     }
 
 
@@ -372,8 +477,14 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
 
     strict_failure = strict and stage_d.get("verdict") == "fail"
 
+    # v0.2.2: prefer the lexically-cleaned draft if Asset C was available
+    # (the cleaned draft IS what Stage D scored). If Asset C wasn't found,
+    # cleaned_draft_ar equals the raw draft (apply_lexical_cleanup is a no-op
+    # when the asset is missing).
+    output_ar = stage_d.get("cleaned_draft_ar") or stage_c.get("draft_ar", "")
+
     return {
-        "translator_version": "0.2.0",
+        "translator_version": "0.2.2",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
@@ -382,7 +493,8 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
             "D_validator": stage_d,
         },
         "regen_count": regen_count,
-        "output_ar": stage_c.get("draft_ar", ""),
+        "output_ar": output_ar,
+        "raw_llm_draft_ar": stage_c.get("draft_ar", ""),
         "strict_mode": strict,
         "strict_failure": strict_failure,
     }
