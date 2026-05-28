@@ -448,6 +448,116 @@ def _build_llm_prompt(text_en: str, term_hints: Dict[str, Any], domain: str) -> 
     return system_prompt, user_prompt
 
 
+# v1.1.0: cross-vendor translation review. After Stage C produces a draft,
+# the review function sends source + draft to a SECOND proxy and asks "does the
+# AR translation correctly render the EN source? Are any terminology hits
+# missing or incorrect?" The reviewer returns a verdict + any specific
+# corrections it spotted. This catches single-LLM hallucinations (e.g., the
+# end-to-end demo's instant-messaging-as-travel typo).
+#
+# Uses the LAN proxy fleet documented in
+# M:\Main\DevTools\AI\config\llm-proxies.md.
+_REVIEW_PROXIES = {
+    "kimi":    {"url": "http://192.168.80.107:11435", "key": "U6hI7j57HpRpz9QaafTJLsJw5PlTXtxBM4pVNTknohE", "model": "kimi-cli"},
+    "codex":   {"url": "http://192.168.80.107:11436", "key": "VJyi6yQDhEGNDE999FkHTqBAG21KdzmW",     "model": "gpt-5.5"},
+    "gemini":  {"url": "http://192.168.80.107:11437", "key": "6fjc4jGwIhXQn7NejizvFVKR7Ps1SXES",     "model": "gemini-2.5-flash"},
+    "minimax": {"url": "http://192.168.80.107:11438", "key": "xL5jUNR9A2lhN5HfLt1ulp9gE2CnBKf4",     "model": "MiniMax-M2.7"},
+}
+
+
+def stage_e_cross_vendor_review(text_en: str, draft_ar: str,
+                                 term_hints: Dict[str, Any],
+                                 reviewer: str = "codex") -> Dict[str, Any]:
+    """Send source + draft to a second LLM proxy for cross-vendor review.
+    Returns {available, verdict, corrections, raw_response}.
+    Verdicts: 'pass' (faithful translation), 'minor_issues' (small fixes
+    suggested), 'major_issues' (re-translation recommended), 'review_failed'.
+    """
+    if reviewer not in _REVIEW_PROXIES:
+        return {"available": False, "reason": f"unknown reviewer: {reviewer}"}
+    p = _REVIEW_PROXIES[reviewer]
+    # Build the review prompt with the expected terminology
+    term_lines = []
+    for h in term_hints.get("asset_g_terminology_hits", [])[:10]:
+        term_lines.append(f"  - {h['en']} → {h['ar']} (corpus-attested)")
+    term_block = "\n".join(term_lines) if term_lines else "  (none provided)"
+    system_prompt = (
+        "You are an Arabic translation reviewer. Given an English source and an "
+        "Arabic draft, return ONLY a JSON object with this shape: "
+        '{"verdict":"pass|minor_issues|major_issues","corrections":[{"ar":"...","should_be":"...","reason":"..."}]}. '
+        "Verdict 'pass' means the AR is faithful and uses the expected terminology. "
+        "'minor_issues' means small word-choice fixes only. 'major_issues' means a "
+        "mistranslation or missing content. corrections is a list of specific token "
+        "substitutions; empty list if verdict is 'pass'. NO prose outside the JSON."
+    )
+    user_prompt = (
+        f"# English source\n{text_en}\n\n"
+        f"# Arabic draft\n{draft_ar}\n\n"
+        f"# Expected terminology (from corpus)\n{term_block}\n\n"
+        f"Review. Output JSON only."
+    )
+    body = json.dumps({
+        "model": p["model"],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        "temperature": 0,
+    }, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url=p["url"] + "/v1/chat/completions",
+        data=body,
+        method="POST",
+        headers={"Authorization": f"Bearer {p['key']}", "Content-Type": "application/json; charset=utf-8"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        content = data["choices"][0]["message"]["content"]
+    except Exception as e:
+        return {"available": True, "verdict": "review_failed",
+                "corrections": [], "error": str(e), "reviewer": reviewer}
+    # Parse JSON out of the response (tolerate markdown fences)
+    parsed = None
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                pass
+    if not isinstance(parsed, dict):
+        return {"available": True, "verdict": "review_failed",
+                "corrections": [], "error": "could not parse JSON",
+                "raw_response": content[:500], "reviewer": reviewer}
+    return {
+        "available": True,
+        "reviewer": reviewer,
+        "verdict": parsed.get("verdict", "review_failed"),
+        "corrections": parsed.get("corrections", []),
+        "raw_response": content[:1000],
+    }
+
+
+def apply_cross_vendor_corrections(draft_ar: str,
+                                    corrections: List[Dict[str, str]]) -> Tuple[str, int]:
+    """Apply the reviewer's specific token substitutions. Returns (new_draft, n_applied).
+    Only applies substitutions where 'ar' appears exactly in draft_ar — refuses to
+    invent corrections that don't have a clean substring match."""
+    n_applied = 0
+    for c in corrections:
+        old = (c.get("ar") or "").strip()
+        new = (c.get("should_be") or "").strip()
+        if not old or not new or old == new:
+            continue
+        if old in draft_ar:
+            draft_ar = draft_ar.replace(old, new)
+            n_applied += 1
+    return draft_ar, n_applied
+
+
 def stage_c_llm_draft(text_en: str, term_hints: Dict[str, Any],
                       tm_hints: Dict[str, Any], domain: str) -> Dict[str, Any]:
     """Call the configured LLM endpoint. Returns the AR draft + metadata.
@@ -669,7 +779,9 @@ def stage_b_tm_lookup(text_en: str, domain: str) -> Dict[str, Any]:
 # Top-level orchestration
 # ---------------------------------------------------------------------------
 
-def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 3) -> Dict[str, Any]:
+def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 3,
+              review_with: Optional[str] = None,
+              auto_apply_corrections: bool = True) -> Dict[str, Any]:
     """Full pipeline. v0.2: A + C real, B stubbed, D real.
     On verdict=='fail' AND strict=True, returns with strict_failure=True.
     """
@@ -696,14 +808,23 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
     # when the asset is missing).
     output_ar = stage_d.get("cleaned_draft_ar") or stage_c.get("draft_ar", "")
 
+    # v1.1.0: optional Stage E cross-vendor review
+    stage_e = None
+    if review_with:
+        stage_e = stage_e_cross_vendor_review(text_en, output_ar, stage_a, reviewer=review_with)
+        if auto_apply_corrections and stage_e.get("corrections"):
+            output_ar, n_applied = apply_cross_vendor_corrections(output_ar, stage_e["corrections"])
+            stage_e["corrections_applied"] = n_applied
+
     return {
-        "translator_version": "1.0.1",
+        "translator_version": "1.1.0",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
             "B_tm_lookup": stage_b,
             "C_llm_draft": stage_c,
             "D_validator": stage_d,
+            "E_cross_vendor_review": stage_e,
         },
         "regen_count": regen_count,
         "output_ar": output_ar,
@@ -726,6 +847,11 @@ def main() -> int:
     p.add_argument("--strict", action="store_true",
                    help="Exit non-zero if Stage D validator returns 'fail'")
     p.add_argument("--max-regen", type=int, default=3, help="Max regen attempts on validator fail")
+    p.add_argument("--review-with", choices=["kimi", "codex", "gemini", "minimax"],
+                   help="Stage E: send the translation through a second LLM proxy for cross-vendor review. "
+                        "If correction suggestions come back, auto-applies them (unless --no-auto-correct).")
+    p.add_argument("--no-auto-correct", action="store_true",
+                   help="Disable auto-application of Stage E corrections (report only).")
     p.add_argument("--json", action="store_true", help="Emit full pipeline result as JSON")
 
     args = p.parse_args()
@@ -739,7 +865,9 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
-    result = translate(text, args.domain, strict=args.strict, max_regen=args.max_regen)
+    result = translate(text, args.domain, strict=args.strict, max_regen=args.max_regen,
+                       review_with=args.review_with,
+                       auto_apply_corrections=not args.no_auto_correct)
     if args.output:
         Path(args.output).write_text(result["output_ar"], encoding="utf-8")
     if args.json:
