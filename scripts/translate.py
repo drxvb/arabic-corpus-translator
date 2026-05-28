@@ -638,13 +638,23 @@ def stage_d_validate(draft_ar: str, source_en: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def stage_b_tm_lookup(text_en: str, domain: str) -> Dict[str, Any]:
-    """v0.2: still a stub. The SPA corpus diagnostic showed 0 paired
-    directories — alignment via title-similarity (Option A) deferred to
-    v0.3+. See references/04-corpus-reality-check.md."""
+    """v1.0.0: DEFINITIVELY DROPPED. The SPA corpus diagnostic (v0.1.1) confirmed
+    Y:\\Linguistics\\NewsDataForTranslation has 0 paired articles. Title-similarity
+    alignment (Option A) was considered for v0.3+ but never shipped because:
+      (1) The corpus state hasn't changed (download is still partial).
+      (2) Stage A + Asset G now provide rich terminology hints (422 tech + 50
+          news pairs cross-vendor-validated), making TM redundant for common
+          terms.
+      (3) Stage D (LLM-cleaned validation with calque dictionary + corpus
+          confirmation) catches what TM would have caught.
+    The 3-stage pipeline (A → C → D) is the v1.0.0 contract. Stage B remains
+    in the return shape for backward compatibility with v0.2-v0.3 consumers
+    but is a documented no-op.
+    """
     return {
         "tm_hits": [],
-        "stub_version": "v0.2",
-        "note": "Stage B is a stub. Corpus alignment requires Option A (title-similarity) work; deferred to v0.3+.",
+        "status": "dropped_in_v1.0.0",
+        "reason": "Corpus has 0 paired articles; Stage A + Asset G provide better terminology hints; Stage D catches what TM would catch.",
     }
 
 
@@ -680,7 +690,7 @@ def translate(text_en: str, domain: str, strict: bool = False, max_regen: int = 
     output_ar = stage_d.get("cleaned_draft_ar") or stage_c.get("draft_ar", "")
 
     return {
-        "translator_version": "0.3.1",
+        "translator_version": "1.0.0",
         "domain": domain,
         "stages": {
             "A_terminology": stage_a,
