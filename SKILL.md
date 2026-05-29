@@ -36,80 +36,12 @@ The 38,897 EN + 38,859 AR articles ARE valuable as **monolingual reference data*
 
 Per the v2.6.0 multi-agent review of `arabic-ai-text-humanizer` (Agent B: translation engineering architect), the user's frustration that "AI always gives wrong translation for these" has a tractable engineering answer: **ground translation in a real Arabic corpus, not in the LLM's training data alone.**
 
-The *original* architecture was a 4-stage pipeline (Stage B was later dropped — the shipped pipeline is A → C → D → E → F; diagram kept for historical context):
-
-```
-INPUT (EN text)
-    │
-    ▼
-┌────────────────────────────────────────┐
-│ Stage A — TERMINOLOGY                  │ ← arabic-corpus-toolkit (340-entry dict)
-│ Look up known calque corrections       │
-│ + topic-guard + exclusion-pattern gates│
-└────────────────┬───────────────────────┘
-                 │ uncovered spans
-                 ▼
-┌────────────────────────────────────────┐
-│ Stage B — TRANSLATION MEMORY (v0.2+)   │ ← SPA bilingual corpus
-│ Fuzzy-match against 38,886 EN/AR pairs │   (UUID-aligned)
-│ Threshold: ≥0.85 sim                   │
-└────────────────┬───────────────────────┘
-                 │ no TM hit
-                 ▼
-┌────────────────────────────────────────┐
-│ Stage C — LLM DRAFT                    │ ← provider-agnostic
-│ Prompt includes term hits + TM         │   (OpenAI-compatible)
-│ near-misses + style refs               │
-└────────────────┬───────────────────────┘
-                 ▼
-┌────────────────────────────────────────┐
-│ Stage D — VALIDATOR (v0.2+)            │ ← arabic-corpus-toolkit
-│ - Calque-rate (uses humanizer's        │   (calque-rate detector)
-│   calque dictionary as detector)       │
-│ - Term-fidelity (% of in-domain terms  │
-│   matching natural_arabic)             │
-│ - N-gram naturalness (corpus LM)       │
-│ Regen up to 3 times if validator fails │
-└────────────────────────────────────────┘
-                 ▼
-OUTPUT (AR text) + provenance per span
-```
-
-## Historical — original v0.1 scope (superseded; current state is v1.9.0 STABLE, see CHANGELOG.md)
-
-- Skill spec (this file) declaring the 4-stage architecture
-- CLI shape in `scripts/translate.py` — argparse + mode flags wired, but Stages B and D are TODO stubs that return placeholder output
-- `references/02-architecture.md` — full per-stage design notes
-- `references/03-eval-strategy.md` — how the "better than corpus baseline" claim becomes measurable (calque-rate reduction ≥60% vs GPT-4o-class baseline; term-fidelity ≥90%; n-gram perplexity within 1 stddev of human-written news)
-
-## Historical — Stage B options evaluated (all rejected; Stage B dropped in v1.0.0)
-
-Three options for Stage B given the corpus reality:
-
-### Option A — Title-similarity alignment (recommended)
-
-Build EN↔AR pairs by fuzzy-matching article titles across the two monolingual collections. Estimated yield: **5-15% pair rate** (~2K-6K usable pairs). Lower than Agent B assumed, but still meaningful seed data.
-
-Pipeline: extract title+date+category from each en.json and ar.json → embed with a multilingual model (LaBSE / multilingual-E5) → top-K nearest cross-language match within ±3-day publication window → confidence-filtered.
-
-### Option B — Drop Stage B (simpler, honest)
-
-Ship the v0.2 translator as **3-stage** (Terminology + LLM Draft + Validator). Skip TM entirely. Simpler, still useful. The monolingual corpora feed Stage D (n-gram naturalness) instead of Stage B.
-
-### Option C — Monolingual-only mining
-
-Build per-language n-gram language models from the 38K+ EN articles and 38K+ AR articles. Use them in Stage D for fluency scoring. No Stage B; Stage D becomes more sophisticated.
-
-### Other v0.2 work (unchanged from v0.1 plan)
-
-- Stage D: implement calque-rate + term-fidelity + n-gram naturalness scoring
-- Adversarial eval set: curate 200 sentences where AI is known to fail
-- LLM backend integration: provider-agnostic via `LLM_API_URL`/`LLM_API_KEY`/`LLM_MODEL`
+The shipped pipeline is **5-stage: A (terminology) → C (LLM draft) → D (validator) → E (cross-vendor review) → F (humanizer gate)**. Stage B (Translation Memory) was dropped after the v0.1.1 corpus-reality check (the diagnostic table above shows 0 paired directories); Asset G's paired terminology + Asset F's mined candidates make TM redundant.
 
 ## Dependencies
 
-- **`arabic-corpus-toolkit`** (v0.4+) — calque dictionary, register policies, corpus statistics. Read via `sys.path` discovery or `ARABIC_CORPUS_TOOLKIT_ROOT` env var. Same resolution pattern as `arabic-ai-text-humanizer` v2.7.0.
-- **`arabic-ai-text-humanizer`** (optional, for Stage D) — calque-rate detector reused as a quality scorer. NOT required at v0.1 because Stage D is stubbed; required by v0.2.
+- **`arabic-corpus-toolkit`** (≥ v1.13.0) — calque dictionary, register policies, corpus stats, `safe_llm_call` resilience. Resolved via `sys.path` discovery or `ARABIC_CORPUS_TOOLKIT_ROOT`.
+- **`arabic-ai-text-humanizer`** (≥ v2.17.0, Stage F) — humanness quality gate.
 
 ## Scope discipline (the Humanizer-≠-Localizer descendant)
 
