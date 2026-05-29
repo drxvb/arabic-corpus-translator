@@ -1,7 +1,7 @@
 # Changelog
 
 Corpus-grounded EN↔AR translation skill. Versions track the SKILL.md status banner; this file is the
-auditable history (extracted from the inline banner during the A8 audit, 2026-05-29).
+auditable per-version history.
 Hard dependency: `arabic-corpus-toolkit` (≥ v1.13.0 for `safe_llm_call`; ≥ v1.5.0 for G1-G4 contracts).
 
 ## v1.9.0 — LLM provider failure resilience (4/4 A7 convergent must-have)
