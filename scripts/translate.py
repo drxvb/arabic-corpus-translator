@@ -699,6 +699,22 @@ def apply_cross_vendor_corrections(draft_ar: str,
     return draft_ar, n_applied
 
 
+def _toolkit_safe_llm_call():
+    """v1.9.0: lazy-import toolkit's safe_llm_call (v1.13.0+). Returns the
+    function or None if toolkit pre-v1.13.0 / unavailable."""
+    tk = _toolkit_root()
+    if tk is None:
+        return None
+    try:
+        scripts_dir = tk / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from safe_llm_call import safe_llm_call  # type: ignore
+        return safe_llm_call
+    except Exception:
+        return None
+
+
 def stage_c_llm_draft(text_en: str, term_hints: Dict[str, Any],
                       tm_hints: Dict[str, Any], domain: str,
                       proxy_name: Optional[str] = None) -> Dict[str, Any]:
@@ -751,33 +767,67 @@ def stage_c_llm_draft(text_en: str, term_hints: Dict[str, Any],
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        return {
-            "draft_ar": "",
-            "ok": False,
-            "error": f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:500]}",
-            "domain": domain,
-        }
-    except (urllib.error.URLError, TimeoutError) as e:
-        return {
-            "draft_ar": "",
-            "ok": False,
-            "error": f"network: {e}",
-            "domain": domain,
-        }
+    # v1.9.0: route through toolkit safe_llm_call when available (4/4 A7 vendor
+    # convergent must-have: retries + circuit breaker + structured failure).
+    # Falls back to inline urllib.request if toolkit pre-v1.13.0 or absent.
+    _safe = _toolkit_safe_llm_call()
+    if _safe is not None:
+        # Use the base URL (strip /v1/chat/completions appended above)
+        base_url = api_url.replace("/v1/chat/completions", "").rstrip("/")
+        result = _safe(base_url, api_key, body, timeout=120.0, max_retries=2,
+                       retry_backoff_s=1.0)
+        if not result.ok:
+            return {
+                "draft_ar": "",
+                "ok": False,
+                "error_class": result.error_class,
+                "error": result.error_detail,
+                "circuit_open": result.circuit_open,
+                "attempts": result.attempts,
+                "latency_ms": result.latency_ms,
+                "domain": domain,
+            }
+        draft = (result.payload or "").strip()
+        if not draft:
+            return {
+                "draft_ar": "",
+                "ok": False,
+                "error_class": "empty_response",
+                "error": "LLM returned empty draft after .strip()",
+                "domain": domain,
+            }
+    else:
+        # Legacy fallback path (toolkit pre-v1.13.0 or unavailable)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return {
+                "draft_ar": "",
+                "ok": False,
+                "error_class": "http_5xx" if 500 <= e.code < 600 else "http_4xx",
+                "error": f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:500]}",
+                "domain": domain,
+            }
+        except (urllib.error.URLError, TimeoutError) as e:
+            return {
+                "draft_ar": "",
+                "ok": False,
+                "error_class": "network",
+                "error": f"network: {e}",
+                "domain": domain,
+            }
 
-    try:
-        draft = payload["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError, TypeError) as e:
-        return {
-            "draft_ar": "",
-            "ok": False,
-            "error": f"malformed LLM response: {e}; raw[0:300]: {str(payload)[:300]}",
-            "domain": domain,
-        }
+        try:
+            draft = payload["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError, TypeError) as e:
+            return {
+                "draft_ar": "",
+                "ok": False,
+                "error_class": "schema_mismatch",
+                "error": f"malformed LLM response: {e}; raw[0:300]: {str(payload)[:300]}",
+                "domain": domain,
+            }
 
     return {
         "draft_ar": draft,
